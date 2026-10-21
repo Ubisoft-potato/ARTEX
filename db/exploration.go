@@ -1123,12 +1123,33 @@ func (s *ExplorationStore) FindingIntentsTerminal() (map[int64]int64, error) {
 }
 
 // Frontier returns open intents ordered by priority desc then id (FIFO tiebreak).
+// Intents whose payload.depends_on list contains any intent not yet in state 'done'
+// are excluded — they remain in state 'open' but are not yet claimable by workers.
+// Old intents without depends_on in their payload pass through unchanged (NULL check).
 func (s *ExplorationStore) Frontier(limit int) ([]*Node, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	// The sub-select checks whether ALL prerequisite intents are done:
+	//   payload->'depends_on' IS NULL          → no deps declared (old or new), always pass
+	//   jsonb_array_length(...) = 0            → empty array, always pass
+	//   NOT EXISTS (SELECT 1 FROM ... dep_id ...)
+	//     finds any dep whose state != 'done'  → blocks entry if any dep is not done
 	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'
+  AND (
+    payload->'depends_on' IS NULL
+    OR jsonb_array_length(payload->'depends_on') = 0
+    OR NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(payload->'depends_on') AS dep_id_text
+      JOIN exploration_nodes dep
+        ON dep.id = dep_id_text::bigint
+       AND dep.exploration_id = $1
+       AND dep.kind = 'intent'
+      WHERE dep.state != 'done'
+    )
+  )
 ORDER BY priority DESC, id ASC LIMIT $2`, s.expID, limit)
 	if err != nil {
 		return nil, err

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
@@ -129,7 +132,14 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
+	// workDir is the base work directory for this task, used by listTaskArtifacts to
+	// locate the task-level shared artifact directory. Set via SetWorkDir; zero = unavailable.
+	workDir string
 }
+
+// SetWorkDir sets the base work directory so listTaskArtifacts can find the
+// task-level shared artifact directory. Called by Worker.execute before building tools.
+func (t *ToolSet) SetWorkDir(dir string) { t.workDir = dir }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.
@@ -1185,6 +1195,8 @@ type intentItem struct {
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	DependsOn []json.RawMessage `json:"depends_on"` // intent node ids that must be done before this enters frontier
+	Mode      string            `json:"mode"`        // "probe"=快速验证可行性(限额 turns) | "exploit"=深度利用(默认)
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1211,9 +1223,28 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		priority = 5
 	}
 	anchors := pidList(it.AssetIDs)
-	payload := map[string]any{"summary": it.Summary}
+	mode := strings.TrimSpace(it.Mode)
+	if mode != "probe" {
+		mode = "exploit" // default; normalise so Frontier/Worker always see a clean value
+	}
+	payload := map[string]any{"summary": it.Summary, "mode": mode}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
+	}
+	// depends_on: validate that every id points to an intent node in this exploration,
+	// then store the list in the payload (Frontier() will use it to block entry).
+	deps := pidList(it.DependsOn)
+	if len(deps) > 0 {
+		for _, depID := range deps {
+			n, err := t.ts.GetNodeWithSources(depID)
+			if err != nil || n == nil {
+				return 0, fmt.Errorf("depends_on id %d 不存在于本任务", depID)
+			}
+			if n.Kind != db.KindIntent {
+				return 0, fmt.Errorf("depends_on id %d 是 %q 节点，depends_on 只接受意图(intent)节点 id", depID, n.Kind)
+			}
+		}
+		payload["depends_on"] = deps
 	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
@@ -1244,6 +1275,8 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			"depends_on": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "前置意图 id 列表（可选）：只有列表中每个意图都变为 done 状态后，本意图才会进入 frontier 被 Worker 领取。用于声明「先拿到凭据（意图 A），再横向移动（本意图）」这类顺序利用链。只能引用意图(intent)节点 id；顶层独立方向请留空。"},
+			"mode": map[string]any{"type": "string", "enum": []string{"probe", "exploit"}, "description": "执行模式（默认 exploit）。probe=探索/快速验证可行性：Worker 用极短 turn 预算（≤12 轮）判断方向是否值得深挖，得到初步结论即写 fact 并停止，不穷举绕过；适合「不确定目标是否存在/可达/可利用」的新方向。exploit=深度利用：Worker 用完整预算、穷举绕过手段，适合已有 probe 确认信号的方向。建议流程：先 probe → 若 fact confidence=high/observed 再用 depends_on 链接一条 exploit 意图。"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2176,7 +2209,320 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 		})
 }
 
+// attackCategories defines the canonical attack-surface taxonomy used by
+// coverageMatrix. Each entry carries a short key, a display name, and a list of
+// case-insensitive keywords (Chinese + English) that signal this category.
+var attackCategories = []struct {
+	Key  string
+	Name string
+	KWs  []string
+}{
+	{"recon", "信息收集", []string{
+		"侦察", "子域", "端口扫描", "指纹", "目录扫描", "枚举", "whois", "dns", "nmap",
+		"subfinder", "dirscan", "dirbuster", "recon", "fingerprint", "discovery",
+		"crawl", "爬取", "banner", "header探测", "资产发现", "fofa", "shodan",
+	}},
+	{"auth", "认证", []string{
+		"登录", "密码", "口令", "凭据", "爆破", "bruteforce", "弱密码", "默认密码",
+		"默认凭证", "token", "apikey", "api key", "api_key", "credential", "login",
+		"password", "认证绕过", "jwt", "oauth", "sso", "basic auth", "bearer",
+	}},
+	{"authz", "授权/越权", []string{
+		"越权", "授权", "idor", "水平越权", "垂直越权", "权限提升", "privilege",
+		"access control", "未授权", "越权访问", "未鉴权", "horizontal", "vertical",
+		"rbac", "acl", "object reference",
+	}},
+	{"injection", "注入", []string{
+		"注入", "sql", "ssti", "命令注入", "xpath", "ldap注入", "inject", "rce",
+		"代码执行", "命令执行", "模板注入", "os command", "eval", "expression",
+		"deserialization", "反序列化", "xxe",
+	}},
+	{"xss", "XSS/客户端", []string{
+		"xss", "跨站", "脚本注入", "cross-site", "反射型", "存储型", "dom xss",
+		"csrf", "跨站请求", "点击劫持", "clickjacking", "open redirect", "重定向",
+	}},
+	{"ssrf", "SSRF", []string{
+		"ssrf", "服务端请求", "内网探测", "metadata", "169.254", "aws metadata",
+		"云元数据", "server-side request", "内网访问", "内网穿透",
+	}},
+	{"file", "文件操作", []string{
+		"文件上传", "上传漏洞", "路径穿越", "lfi", "rfi", "目录遍历", "任意文件读",
+		"upload", "path traversal", "文件包含", "download", "任意文件", "file inclusion",
+		"zip slip",
+	}},
+	{"logic", "业务逻辑", []string{
+		"业务逻辑", "支付", "优惠券", "竞争条件", "race condition", "流程绕过",
+		"逻辑绕过", "价格篡改", "订单", "积分", "余额", "数量篡改", "接口顺序",
+	}},
+	{"config", "配置/信息泄露", []string{
+		"配置错误", "暴露接口", "debug", "swagger", "cors", "信息泄露", "敏感信息",
+		"备份文件", "源码泄露", "未授权接口", "env", "环境变量", "git泄露",
+		".git", "备份", "配置泄露", "robots.txt", "api文档",
+	}},
+	{"infra", "基础设施/供应链", []string{
+		"容器", "docker", "k8s", "kubernetes", "云", "横向移动", "内网穿透",
+		"基础设施", "pivot", "lateral", "供应链", "cve", "组件漏洞", "已知漏洞",
+		"dependency", "npm", "pip", "log4j", "spring", "struts",
+	}},
+}
+
+// classifyCategories returns the attack category keys that match the given
+// intent summary (case-insensitive keyword scan). Returns nil if none match
+// (no explicit category signal — treated as "other" in the matrix).
+func classifyCategories(summary string) []string {
+	lower := strings.ToLower(summary)
+	var cats []string
+	for _, cat := range attackCategories {
+		for _, kw := range cat.KWs {
+			if strings.Contains(lower, kw) {
+				cats = append(cats, cat.Key)
+				break
+			}
+		}
+	}
+	return cats
+}
+
+// coverageMatrix builds an attack-surface coverage matrix for the current task.
+// It reads all intents from the exploration graph, classifies each by attack
+// category via keyword scan, and aggregates by (asset_id × category).
+// Returns the top uncovered gaps so the Planner can prioritise intent generation.
+func (t *ToolSet) coverageMatrix() actool.CoreTool {
+	return readTool("coverage_matrix",
+		"生成本任务的攻击面覆盖矩阵：对每个已被意图关联的资产，统计哪些攻击类别已有意图覆盖（open/running/done 均算计划中）、哪些仍是空白。\n"+
+			"返回：coverage_pct（覆盖格子占比）、category_coverage（各类别已覆盖资产数）、top_gaps（空白最多的资产及缺失类别，优先派意图补这里）、zero_targeted_assets（范围内完全没有意图关联的资产）。\n"+
+			"建议每轮规划前调一次，识别系统性空白，防止覆盖不均。",
+		obj(map[string]any{
+			"top_n": intp("返回 top_gaps 的资产数（默认 8）"),
+		}),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.ts == nil {
+				return actool.Errorf("coverage_matrix 需要任务上下文"), nil
+			}
+			var a struct {
+				TopN int `json:"top_n"`
+			}
+			_ = json.Unmarshal(in, &a)
+			if a.TopN <= 0 {
+				a.TopN = 8
+			}
+
+			// ── 1. load all intents ───────────────────────────────────────────
+			allIntents, err := t.ts.ListByKind(db.KindIntent, 3000)
+			if err != nil {
+				return actool.Errorf("读取意图失败: " + err.Error()), nil
+			}
+
+			// ── 2. build asset → covered-categories map ───────────────────────
+			// assetCovered[assetID][category] = true
+			assetCovered := map[int64]map[string]bool{}
+			// categoryCoveredAssets[cat] = set of asset IDs covered
+			catAssets := map[string]map[int64]bool{}
+			globalCats := map[string]bool{} // categories from intents with no asset_ids
+			totalIntents := 0
+
+			for _, n := range allIntents {
+				var p map[string]any
+				if err := json.Unmarshal(n.Payload, &p); err != nil {
+					continue
+				}
+				summary, _ := p["summary"].(string)
+				cats := classifyCategories(summary)
+				if len(cats) == 0 {
+					totalIntents++
+					continue
+				}
+				totalIntents++
+
+				// collect asset_ids from payload
+				var assetIDs []int64
+				if raw, ok := p["asset_ids"]; ok {
+					switch v := raw.(type) {
+					case []any:
+						for _, x := range v {
+							switch id := x.(type) {
+							case float64:
+								assetIDs = append(assetIDs, int64(id))
+							case int64:
+								assetIDs = append(assetIDs, id)
+							}
+						}
+					}
+				}
+
+				if len(assetIDs) == 0 {
+					// global intent (no specific asset) — mark in global bucket
+					for _, c := range cats {
+						globalCats[c] = true
+					}
+					continue
+				}
+				for _, aid := range assetIDs {
+					if assetCovered[aid] == nil {
+						assetCovered[aid] = map[string]bool{}
+					}
+					for _, c := range cats {
+						assetCovered[aid][c] = true
+						if catAssets[c] == nil {
+							catAssets[c] = map[int64]bool{}
+						}
+						catAssets[c][aid] = true
+					}
+				}
+			}
+
+			// ── 3. category coverage summary ──────────────────────────────────
+			nCats := len(attackCategories)
+			type catStat struct {
+				Key   string `json:"key"`
+				Name  string `json:"name"`
+				Count int    `json:"assets_covered"` // assets with ≥1 intent in this cat
+			}
+			catStats := make([]catStat, 0, nCats)
+			for _, cat := range attackCategories {
+				catStats = append(catStats, catStat{
+					Key:   cat.Key,
+					Name:  cat.Name,
+					Count: len(catAssets[cat.Key]),
+				})
+			}
+
+			// ── 4. top_gaps: assets with most missing categories ──────────────
+			type gapEntry struct {
+				AssetID   int64    `json:"asset_id"`
+				Covered   []string `json:"covered"`
+				Missing   []string `json:"missing"`
+				MissingN  int      `json:"-"`
+			}
+			var gaps []gapEntry
+			for aid, covered := range assetCovered {
+				var covList, missList []string
+				for _, cat := range attackCategories {
+					if covered[cat.Key] {
+						covList = append(covList, cat.Key)
+					} else {
+						missList = append(missList, cat.Key)
+					}
+				}
+				if len(missList) > 0 {
+					gaps = append(gaps, gapEntry{
+						AssetID:  aid,
+						Covered:  covList,
+						Missing:  missList,
+						MissingN: len(missList),
+					})
+				}
+			}
+			// sort by most missing first
+			for i := 1; i < len(gaps); i++ {
+				for j := i; j > 0 && gaps[j].MissingN > gaps[j-1].MissingN; j-- {
+					gaps[j], gaps[j-1] = gaps[j-1], gaps[j]
+				}
+			}
+			if len(gaps) > a.TopN {
+				gaps = gaps[:a.TopN]
+			}
+
+			// ── 5. coverage percentage ────────────────────────────────────────
+			nAssets := len(assetCovered)
+			totalCells := nAssets * nCats
+			coveredCells := 0
+			for _, covered := range assetCovered {
+				coveredCells += len(covered)
+			}
+			pct := 0
+			if totalCells > 0 {
+				pct = coveredCells * 100 / totalCells
+			}
+
+			// ── 6. assets with zero intent targeting (from untested list) ─────
+			var zeroTargeted []map[string]any
+			if t.as != nil && t.taskID > 0 {
+				untested, _, _ := t.as.ListUntestedAssetsWithSources(t.taskID, "", 20, 0)
+				for _, a := range untested {
+					if assetCovered[a.ID] == nil {
+						zeroTargeted = append(zeroTargeted, map[string]any{
+							"asset_id": a.ID,
+							"type":     a.Type,
+							"label":    a.Label,
+						})
+					}
+				}
+			}
+
+			summaryStr := fmt.Sprintf(
+				"%d 个资产已被意图关联 × %d 个攻击类别 = %d 格；已覆盖 %d 格（%d%%）；全局意图（无资产 id）已覆盖类别：%v",
+				nAssets, nCats, totalCells, coveredCells, pct, mapKeys(globalCats),
+			)
+
+			return jsonResult(map[string]any{
+				"summary":              summaryStr,
+				"total_intents":        totalIntents,
+				"assets_targeted":      nAssets,
+				"coverage_pct":         pct,
+				"category_coverage":    catStats,
+				"top_gaps":             gaps,
+				"zero_targeted_assets": zeroTargeted,
+			})
+		})
+}
+
+// mapKeys returns sorted keys of a bool map as a string slice.
+func mapKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
+// listTaskArtifacts returns a read-only view of the task-level shared artifact
+// directory — files that earlier workers exported for cross-intent handoff.
+// Returns an empty list when no files have been shared yet (new or old tasks).
+func (t *ToolSet) listTaskArtifacts() actool.CoreTool {
+	return readTool("list_task_artifacts",
+		"列出本任务跨 Worker 共享目录（shared/）中已有的文件。前序 Worker 把需要传递的关键产出（session token、凭据、下载文件、中间 PoC 脚本等）写到共享目录后，Planner 可通过本工具查看，并在新意图里告知后续 Worker 去读取对应文件。共享目录路径也会在 Worker 的系统提示中说明，可直接用 Bash 读写。",
+		obj(map[string]any{}),
+		func(_ context.Context, _ json.RawMessage) (actool.Result, error) {
+			if t.workDir == "" || t.taskID == 0 {
+				return jsonResult(map[string]any{"files": []any{}, "note": "无任务上下文，共享目录不可用"})
+			}
+			dir := filepath.Join(t.workDir, "tasks", strconv.FormatInt(t.taskID, 10), "shared")
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return jsonResult(map[string]any{"dir": dir, "files": []any{}})
+				}
+				return actool.Errorf(fmt.Sprintf("读取共享目录失败: %v", err)), nil
+			}
+			type fileEntry struct {
+				Name    string `json:"name"`
+				Size    int64  `json:"size_bytes"`
+				ModTime string `json:"mod_time"`
+			}
+			var files []fileEntry
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				info, err := e.Info()
+				if err != nil {
+					continue
+				}
+				files = append(files, fileEntry{
+					Name:    e.Name(),
+					Size:    info.Size(),
+					ModTime: info.ModTime().Format(time.RFC3339),
+				})
+			}
+			if files == nil {
+				files = []fileEntry{}
+			}
+			return jsonResult(map[string]any{"dir": dir, "files": files})
+		})
+}
+
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
@@ -2197,5 +2543,9 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// list_task_artifacts：查看本任务跨 Worker 共享目录的文件列表，用于感知前序 Worker 的产出。
+		t.listTaskArtifacts(),
+		// coverage_matrix：每轮规划前调用，识别哪些资产/攻击类别组合仍是空白，防止系统性漏测。
+		t.coverageMatrix(),
 	}
 }

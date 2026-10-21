@@ -263,9 +263,21 @@ func artifactSpec(dir string) string {
 
 // workerArtifactSpec is the worker's 段 [C]: its per-intent run dir is pre-created
 // by the engine (ensureRunDir), so it just writes relative paths there — no manual
-// mkdir, no cross-worker name collisions.
-func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+// mkdir, no cross-worker name collisions. sharedDir is the task-level directory
+// all workers in the same task can read/write for cross-intent artifact handoff.
+func workerArtifactSpec(runDir, sharedDir string) string {
+	s := "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+	s += "\n\n**跨意图共享目录 " + sharedDir + "**：需要传递给后续 Worker 的关键产出（session token、凭据文件、下载的 JS/配置、中间 PoC 脚本等）**用 Bash 写到这里**；Planner 可通过 list_task_artifacts 工具看到目录中的文件，并在新意图里指引后续 Worker 读取。普通临时产物仍写私有工作目录，只把真正需要跨意图复用的放到共享目录。"
+	return s
+}
+
+// taskSharedDir returns the shared artifact directory for a task, creating it if
+// needed. All workers in the same task share this directory for cross-intent
+// artifact handoff. Best-effort mkdir — tool returns gracefully on absence.
+func taskSharedDir(base string, taskID int64) string {
+	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10), "shared")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
@@ -285,12 +297,12 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+func workerSystem(proxyAddr, caCert, dataDir, runDir, sharedDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir, sharedDir)
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -300,6 +312,39 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 // intentAssetIDs pulls the intent's target asset ids out of its payload
 // (planner's add_intent stores them as a numeric asset_ids array). nil on absence
 // or malformed payload.
+// intentMode reads the "mode" field from an intent's JSONB payload.
+// Returns "" (treated as "exploit") for old intents without this field.
+func intentMode(intent *db.Node) string {
+	if intent == nil {
+		return ""
+	}
+	var p struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Mode)
+}
+
+// probeMaxTurns is the hard turn cap applied when an intent's mode == "probe".
+// It overrides (lowers) the configured w.maxTurns so the worker stops quickly
+// once it has a signal, rather than exhausting all bypass techniques.
+const probeMaxTurns = 12
+
+// workerProbeBlock is 段 [P]: injected into the system prompt only in probe mode.
+// It overrides the "walk all bypasses" instruction from workerDefaultTmpl so the
+// worker returns a quick feasibility verdict instead of a thorough exploitation run.
+func workerProbeBlock() string {
+	return `
+
+**【探索模式（probe）— 本次意图为快速可行性验证，最多 ` + fmt.Sprintf("%d", probeMaxTurns) + ` 轮】**：
+- **目标**：判断这个方向是否值得深挖，得出初步结论后立刻写 fact 并停止。
+- **明确死胡同**（目标不存在 / 版本不匹配 / 接口完全不可达 / 无任何可注入点）：写一条 confidence=low 的 fact（summary 说清为何判断是死路、evidence 给依据），然后停止——**不要尝试绕过，不要换 payload 再试**。
+- **发现有信号**（返回值异常 / 有注入迹象 / 端口开放 / 存在疑似脆弱参数）：写一条 confidence=observed/high 的 fact（summary 写清信号内容），然后停止——**把深度利用留给规划者升级为 exploit 意图**，不要在这里深挖。
+- 忽略 workerDefaultTmpl 第 2 条"把所有绕过手段走完"的指令；该指令仅适用于 exploit 模式。`
+}
+
 func intentAssetIDs(intent *db.Node) []int64 {
 	if intent == nil {
 		return nil
@@ -389,11 +434,17 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	sharedDir := taskSharedDir(w.workDir, taskID) // 任务级跨 Worker 共享目录
+	tsx.SetWorkDir(w.workDir)
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	mode := intentMode(intent)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir, sharedDir)
+	if mode == "probe" {
+		sysBody += workerProbeBlock()
+	}
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -426,6 +477,14 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
 	}
+	// probe 模式：hard-cap MaxTurns 到 probeMaxTurns，避免在死胡同上耗尽预算。
+	// 老意图 mode="" → exploit，行为不变。
+	effectiveMaxTurns := w.maxTurns
+	if mode == "probe" {
+		if effectiveMaxTurns == 0 || effectiveMaxTurns > probeMaxTurns {
+			effectiveMaxTurns = probeMaxTurns
+		}
+	}
 	opts := agentcore.Options{
 		Provider:        w.prov,
 		SystemPrompt:    system,
@@ -452,7 +511,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
 		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
-		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
+		MaxTurns:   effectiveMaxTurns, // probe 模式上限 probeMaxTurns；exploit/默认用配置值(0=不限)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
 		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
 		MaxDuration: maxDur,

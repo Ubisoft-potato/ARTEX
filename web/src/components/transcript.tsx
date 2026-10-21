@@ -41,7 +41,7 @@ function workerColor(name: string): string {
 }
 
 const chip = (worker: string) =>
-  "mt-0.5 shrink-0 rounded px-1 text-[9px] font-medium text-white " + workerColor(worker);
+  "mt-0.5 shrink-0 rounded px-1 text-[10px] font-medium text-white " + workerColor(worker);
 
 // useInView latches true when the ref'd element first comes within `rootMargin` of
 // the enclosing scroll viewport. Blocks that always show their full body (user
@@ -458,20 +458,20 @@ function ToolBlock({
     <section
       ref={targetRef}
       aria-label={focused ? `定位的工具调用 #${use?.seq}` : undefined}
-      className={focused ? "rounded-lg border-2 border-primary bg-primary/5 p-3 text-xs" : "text-xs"}
+      className={focused ? "rounded-lg border-2 border-primary bg-primary/5 p-3 text-sm" : "text-sm"}
     >
       <button type="button" onClick={toggle} className="flex w-full items-start gap-2 py-1 text-left hover:bg-muted/40">
         <span className="mt-0.5 text-muted-foreground">
-          {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+          {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         </span>
-        <ToolIcon className={"mt-0.5 size-3.5 shrink-0 " + (running ? "text-sky-600 dark:text-sky-400" : statusTone)} />
+        <ToolIcon className={"mt-0.5 size-4 shrink-0 " + (running ? "text-sky-600 dark:text-sky-400" : statusTone)} />
         {showWorker && <span className={chip(group.worker)}>{group.worker}</span>}
         <span className="shrink-0 font-medium text-sky-600 dark:text-sky-400">{toolName}</span>
         {cmd && <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground">{cmd}</span>}
         <span className={"ml-auto shrink-0 font-medium " + statusTone}>{statusText}</span>
       </button>
       {open && (
-        <pre className="ml-7 mb-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 font-mono text-[11px] leading-relaxed">
+        <pre className="ml-8 mb-1 max-h-80 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2.5 font-mono text-[13px] leading-relaxed">
           {detail ?? "加载中…"}
         </pre>
       )}
@@ -527,20 +527,20 @@ function MessageBlock({
   }
 
   return (
-    <div className="text-xs">
+    <div className="text-sm">
       <button type="button" onClick={toggle} className="flex w-full items-start gap-2 py-1 text-left hover:bg-muted/40">
         <span className="mt-0.5 text-muted-foreground">
-          {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+          {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         </span>
-        <Icon className={"mt-0.5 size-3.5 shrink-0 " + tone} />
+        <Icon className={"mt-0.5 size-4 shrink-0 " + tone} />
         {showWorker && <span className={chip(group.worker)}>{group.worker}</span>}
         <span className={"min-w-0 flex-1 truncate " + tone}>
           {body}
-          {hasThinking && <span className="ml-1 text-[10px] text-muted-foreground">· 含推理</span>}
+          {hasThinking && <span className="ml-1 text-xs text-muted-foreground">· 含推理</span>}
         </span>
       </button>
       {open && (
-        <pre className="ml-7 mb-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 font-mono text-[11px] leading-relaxed">
+        <pre className="ml-8 mb-1 max-h-80 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2.5 font-mono text-[13px] leading-relaxed">
           {detail ?? "加载中…"}
         </pre>
       )}

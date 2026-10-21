@@ -581,6 +581,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// list_task_artifacts：查看本任务跨 Worker 共享目录（shared/）中已有的文件，获取前序 Worker 的产出路径。
+		t.listTaskArtifacts(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
@@ -604,6 +606,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// coverage_matrix：查看本任务攻击面覆盖矩阵，识别哪些资产/类别组合仍是空白。
+		t.coverageMatrix(),
 	}
 }
 
