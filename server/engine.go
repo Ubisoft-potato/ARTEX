@@ -797,6 +797,32 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// plannerRetryDelay returns the backoff after the Nth consecutive failed planning
+// round: 5s, 15s, 45s, then 2m. A failed round used to be only a log line, so a
+// provider hiccup or a loop left the task idle until the next (up to 10 min)
+// heartbeat. Bounded exponential retry keeps progress without hammering a
+// struggling endpoint.
+func plannerRetryDelay(failures int) time.Duration {
+	d := 5 * time.Second
+	for i := 1; i < failures && d < 2*time.Minute; i++ {
+		d *= 3
+	}
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
+}
+
+// plannerMaxConsecutiveFailures caps the fast retry loop. After this many
+// consecutive failed rounds the engine stops arming the retry timer and falls
+// back to the normal heartbeat, so a permanently bad endpoint (401/404) or an
+// always-timing-out model cannot be hammered every two minutes forever.
+const plannerMaxConsecutiveFailures = 8
+
+func plannerRetryAllowed(failures int) bool {
+	return failures <= plannerMaxConsecutiveFailures
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -804,6 +830,15 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	// 触发第一轮规划。之后每次唤醒(边沿/心跳)都重臂 = 距上次任意规划触发的时长。
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
+
+	// retry is armed only after a failed round. It is separate from the heartbeat so
+	// a provider error / loop retries in seconds instead of silently idling until the
+	// next (up to 10 min) heartbeat; failures resets on any successful round.
+	retry := time.NewTimer(time.Hour)
+	retry.Stop()
+	defer retry.Stop()
+	failures := 0
+	retrySuspended := false
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
@@ -881,8 +916,42 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
-			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
+			failures++
+			var what string
+			switch {
+			case errors.Is(err, agent.ErrToolLoop):
+				what = "检测到重复工具调用死循环，已中止本轮"
+				planner.NoteToolLoop(t.ExpID) // tell the next round not to replay the same pattern; drop the stale todo list
+			case errors.Is(err, agent.ErrRunIdle):
+				what = "模型流长时间无输出，已中止本轮"
+			case errors.Is(err, context.DeadlineExceeded):
+				what = "本轮超出墙钟预算，已中止"
+			default:
+				what = "规划出错"
+			}
+			if !plannerRetryAllowed(failures) {
+				if !retrySuspended {
+					retrySuspended = true
+					log.Printf("[planner] task %s %s（连续第 %d 次失败），已停止快速重试，退回心跳/新事件: %v", t.ID, what, failures, err)
+					e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true,
+						Summary: fmt.Sprintf("%s（连续第 %d 次失败），已停止快速重试，退回心跳/新事件；请检查模型或网络后手动恢复", what, failures),
+						Detail:  err.Error()})
+				} else {
+					log.Printf("[planner] task %s %s（连续第 %d 次失败，快速重试仍暂停）: %v", t.ID, what, failures, err)
+				}
+				resetPlannerTimer(retry, time.Hour)
+			} else {
+				delay := plannerRetryDelay(failures)
+				log.Printf("[planner] task %s %s（连续第 %d 次，%s 后重试）: %v", t.ID, what, failures, delay, err)
+				e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true,
+					Summary: fmt.Sprintf("%s（连续第 %d 次），%s 后重试", what, failures, delay),
+					Detail:  err.Error()})
+				resetPlannerTimer(retry, delay)
+			}
 		case met:
+			failures = 0
+			retrySuspended = false
+			resetPlannerTimer(retry, time.Hour)
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
 			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
@@ -892,7 +961,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
 			// 归为 stopped(而非 blocked)。
 			e.cancelExec(t.ID, agent.AbortGoalMet)
+		case ectx.Err() != nil:
+			// pause / kill / shutdown — not a planner failure; don't arm a retry.
+			failures = 0
+			retrySuspended = false
+			resetPlannerTimer(retry, time.Hour)
+			log.Printf("[planner] task %s 规划轮被取消: %v", t.ID, ectx.Err())
 		default:
+			failures = 0
+			retrySuspended = false
+			resetPlannerTimer(retry, time.Hour)
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
 		e.touch(t.ID)
@@ -907,6 +985,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
 			runRound("heartbeat")
+		case <-retry.C:
+			// 上一轮失败后的退避重试；不是心跳,但同样会重臂心跳。
+			runRound("retry")
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
@@ -1134,6 +1215,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
 	state := "done"
 	switch {
+	case errors.Is(err, agent.ErrToolLoop), errors.Is(err, agent.ErrRunIdle), errors.Is(err, context.DeadlineExceeded):
+		// A loop / idle stream / run-budget cancellation is "tried but not
+		// finished", not a permanent dead end: mark exhausted so the planner can
+		// retry the direction instead of silently dropping it.
+		state = "exhausted"
+		log.Printf("[worker %s] intent %d 可恢复中止(exhausted): %v", name, intent.ID, err)
 	case err != nil:
 		state = "blocked"
 	case reason == harness.ReasonMaxTurns:

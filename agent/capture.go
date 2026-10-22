@@ -2,9 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -37,6 +38,52 @@ func captureRun(ctx context.Context, opts agentcore.Options, input string, emit 
 func captureRunSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity)) (string, harness.TerminalReason, error) {
 	ctx, auditTrace := intercept.WithTrace(ctx, input, approvalHistory(s.Messages()))
 	defer auditTrace.Finish()
+
+	// Shared no-progress watchdog: a provider that sends headers and then stops
+	// streaming is not caught by MaxDuration (turn-boundary) or HTTP header
+	// timeouts. Cancelling the run ctx is enough for the SDK's request body read
+	// to unwind. The event loop below refreshes lastEvent on every event.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var lastEvent atomic.Int64
+	lastEvent.Store(time.Now().UnixNano())
+	var toolsInFlight atomic.Int64
+	var idleFired atomic.Bool
+	watchdogDone := make(chan struct{})
+	defer close(watchdogDone)
+	go func() {
+		interval := runIdleTimeout / 4
+		if interval > 30*time.Second {
+			interval = 30 * time.Second
+		}
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogDone:
+				return
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				// A long-running tool (nmap/sqlmap/brute force) produces no model
+				// events for minutes but is not a stalled stream. The hard run ctx
+				// is the backstop for a tool that hangs; only cut truly idle model
+				// streams here.
+				if toolsInFlight.Load() > 0 {
+					continue
+				}
+				if time.Since(time.Unix(0, lastEvent.Load())) >= runIdleTimeout {
+					idleFired.Store(true)
+					cancelRun()
+					return
+				}
+			}
+		}
+	}()
+
 	var reason harness.TerminalReason
 	rec := func(r db.Activity) {
 		if r.Kind == "text" || r.Kind == "tool_result" {
@@ -48,8 +95,19 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 	}
 	toolNames := map[string]string{} // tool_use id -> name, to label results
 
+	// A single thinking/text run is coalesced for display, but an unbounded run
+	// (a model stuck "thinking" for tens of minutes) must not grow the in-memory
+	// buffer forever. Flush a chunk when it gets large; the next delta starts a
+	// new activity with the same kind, so nothing is lost.
+	const maxDeltaBuf = 512 << 10
+	// Cap the total text persisted as activity/audit detail. The transcript still
+	// has the full conversation; this only prevents a runaway text/thinking stream
+	// from growing the activity table and in-memory audit trace without bound.
+	const maxRunTextBytes = 4 << 20
 	var tbuf strings.Builder
 	var tkind string
+	var textBytes int
+	var textCapped bool
 	flush := func() {
 		if tbuf.Len() == 0 {
 			return
@@ -58,9 +116,20 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 		k := tkind
 		tbuf.Reset()
 		tkind = ""
-		if s != "" {
-			rec(db.Activity{Kind: k, Summary: firstLine(s, 200), Detail: s})
+		if s == "" || textCapped {
+			return
 		}
+		if textBytes+len(s) > maxRunTextBytes {
+			if remaining := maxRunTextBytes - textBytes; remaining > 0 {
+				s = safePrefixBytes(s, remaining)
+			} else {
+				s = ""
+			}
+			s += "\n…（本轮输出过长，后续文本已省略）"
+			textCapped = true
+		}
+		textBytes += len(s)
+		rec(db.Activity{Kind: k, Summary: firstLine(s, 200), Detail: s})
 	}
 	addDelta := func(kind, text string) {
 		if text == "" {
@@ -71,15 +140,28 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 		}
 		tkind = kind
 		tbuf.WriteString(text)
+		if tbuf.Len() >= maxDeltaBuf {
+			flush()
+		}
 	}
 	lastTool := &runTrace{startedAt: time.Now()}
 	var lastUsage *llm.Usage
+	var loop toolLoopGuard
+	pendingCalls := map[string]toolCallSig{} // tool_use id -> name + input signature
+	var loopErr error
 
 	var finalText string
 	var rerr error
-	for ev, err := range s.Prompt(ctx, input) {
+stream:
+	for ev, err := range s.Prompt(runCtx, input) {
+		lastEvent.Store(time.Now().UnixNano())
 		if err != nil {
 			flush()
+			if idleFired.Load() {
+				msg := fmt.Sprintf("模型流超过 %s 没有任何输出，已中止本轮以避免挂死（通常是 provider/网络卡住）", runIdleTimeout)
+				rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: msg, Detail: msg}, lastUsage))
+				return finalText, reason, ErrRunIdle
+			}
 			if ctx.Err() != nil { // engine/user cancellation, not a provider failure
 				sum, detail := terminalText(ctx, &harness.Terminal{Reason: reason, Err: ctx.Err()}, lastTool)
 				rec(activityWithUsage(db.Activity{Kind: "result", Summary: firstLine(sum, 400), Detail: detail}, lastUsage))
@@ -95,6 +177,9 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 			}
 			flush()
 			toolNames[ev.ToolUse.ID] = ev.ToolUse.Name
+			inputSig := loop.remember(ev.ToolUse.Name, ev.ToolUse.Input)
+			pendingCalls[ev.ToolUse.ID] = toolCallSig{name: ev.ToolUse.Name, input: inputSig}
+			toolsInFlight.Add(1)
 			in := string(ev.ToolUse.Input)
 			lastTool.start(ev.ToolUse.ID, ev.ToolUse.Name, in)
 			auditTrace.Start(ev.ToolUse.ID, ev.ToolUse.Name, ev.ToolUse.Input)
@@ -107,9 +192,24 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 			flush()
 			out := blocksText(ev.ToolResult.Content)
 			lastTool.done(ev.ToolResult.ToolUseID)
+			if _, ok := pendingCalls[ev.ToolResult.ToolUseID]; ok {
+				toolsInFlight.Add(-1)
+			}
 			auditTrace.Complete(ev.ToolResult.ToolUseID, out, ev.ToolResult.IsError)
 			rec(db.Activity{Kind: "tool_result", Tool: toolNames[ev.ToolResult.ToolUseID], ToolUseID: ev.ToolResult.ToolUseID,
 				IsError: ev.ToolResult.IsError, Summary: firstLine(out, 200), Detail: out})
+			// Decide loop state only after seeing the result: identical command
+			// with a changing result is a legitimate poll/retry, not a loop.
+			if call, ok := pendingCalls[ev.ToolResult.ToolUseID]; ok {
+				delete(pendingCalls, ev.ToolResult.ToolUseID)
+				if loop.observeResult(call.name, call.input, []byte(out)) {
+					flush()
+					loopErr = ErrToolLoop
+					msg := fmt.Sprintf("检测到连续/周期性重复的 %s 工具调用（输入与结果相同），已中止本轮以防死循环（通常是模型在原地打转；下一轮会重新规划）", call.name)
+					rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: msg, Detail: msg}, lastUsage))
+					break stream
+				}
+			}
 		case harness.KindText:
 			addDelta("text", ev.Text)
 		case harness.KindThinking:
@@ -144,6 +244,9 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				if sum == "" || ev.Terminal.Reason == harness.ReasonAbortedTools || ev.Terminal.Reason == harness.ReasonAbortedStreaming {
 					sum, detail = terminalText(ctx, ev.Terminal, lastTool)
 				}
+				if len(detail) > maxRunTextBytes {
+					detail = safePrefixBytes(detail, maxRunTextBytes) + "\n…（已截断，完整内容见 transcript）"
+				}
 				u := ev.Terminal.Usage // cumulative token usage for this session
 				rec(db.Activity{Kind: "result", IsError: ev.Terminal.Err != nil,
 					Summary: firstLine(sum, 400), Detail: detail,
@@ -156,6 +259,12 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 		}
 	}
 	flush() // safety: any unflushed text if the stream ended without KindResult
+	if loopErr != nil {
+		return finalText, reason, loopErr
+	}
+	if idleFired.Load() {
+		return finalText, reason, ErrRunIdle
+	}
 	return finalText, reason, rerr
 }
 
@@ -191,10 +300,21 @@ func firstLine(s string, max int) string {
 	if before, _, found := strings.Cut(s, "\n"); found {
 		s = before
 	}
-	if utf8.RuneCountInString(s) > max {
-		s = string([]rune(s)[:max]) + "…"
+	return truncateRunes(s, max, "…")
+}
+
+// safePrefixBytes returns at most n bytes of s without splitting a UTF-8 rune.
+func safePrefixBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
 	}
-	return s
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && (s[n]&0xC0) == 0x80 {
+		n--
+	}
+	return s[:n]
 }
 
 // Preserve the recorded session's visible messages, excluding thinking blocks.

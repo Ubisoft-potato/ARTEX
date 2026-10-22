@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -14,6 +16,27 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+)
+
+// runSettleGrace is extra wall-clock time allowed after an agent's soft budget
+// expires for the SDK settlement phase to checkpoint its result. The settlement
+// phase is already bounded by Settlement.MaxTurns; this grace only prevents a
+// stuck model stream inside settlement from hanging the whole round forever.
+const runSettleGrace = 3 * time.Minute
+
+const (
+	// defaultPlannerRun is one planning round's wall-clock budget when run_seconds
+	// is unset. A round is a situational review plus a handful of write-backs; it
+	// should never need half an hour.
+	defaultPlannerRun = 8 * time.Minute
+	// plannerRunCeiling caps one round even when run_seconds is configured higher.
+	// The 2026-10-22 incident ran a single planner Plan() for ~2h because the
+	// planner had no wall-clock bound at all (MaxDuration was 0), repeatedly
+	// emitting the same TodoWrite turn. The ceiling makes that impossible.
+	plannerRunCeiling = 10 * time.Minute
+	// plannerTurnCeiling bounds tool-turns when max_turns=0 (unlimited). Normal
+	// rounds use a handful of turns; 40 is only a degenerate-loop backstop.
+	plannerTurnCeiling = 40
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -28,6 +51,7 @@ type Planner struct {
 	window            int                                    // context window in tokens (for compaction)
 	windowFn          func() int                             // optional dynamic task-chain minimum
 	maxTurns          int                                    // max agent turns per run (0 = unlimited)
+	runTimeout        time.Duration                          // wall-clock budget for one round (0 = default)
 	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
 	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
@@ -46,6 +70,11 @@ type Planner struct {
 	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
 	todoMu sync.Mutex
 	todos  map[int64]*actool.TodoStore
+
+	// loopHint is set by the engine when the previous round was cut by the shared
+	// tool-loop guard; the next round tells the model explicitly not to replay the
+	// same degenerate pattern (observed: identical TodoWrite every turn).
+	loopHint atomic.Bool
 }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
@@ -81,6 +110,41 @@ func (p *Planner) maxTokens() int {
 	return p.maxTokensFn()
 }
 
+// SetRunTimeout configures the wall-clock budget for one planning round
+// (0 = defaultPlannerRun). When the soft budget expires the SDK still runs its
+// settlement phase; a hard deadline at budget+runSettleGrace cuts a stuck model
+// stream that settlement cannot finish. Safe to call before Plan.
+func (p *Planner) SetRunTimeout(run time.Duration) {
+	p.runTimeout = run
+}
+
+// runBudget returns the effective soft wall-clock budget for one round, capped so
+// a misconfigured run_seconds (or the old 0=unlimited default) cannot turn a
+// degenerate loop back into a multi-hour hang.
+func (p *Planner) runBudget() time.Duration {
+	d := p.runTimeout
+	if d <= 0 {
+		d = defaultPlannerRun
+	}
+	if d > plannerRunCeiling {
+		d = plannerRunCeiling
+	}
+	return d
+}
+
+// NoteToolLoop records that the previous round was aborted by the shared
+// tool-loop guard, so the next round can tell the model explicitly instead of
+// letting it repeat the same degenerate pattern. The stale todo store for this
+// task is reset too; otherwise the loop hint and the old list fight each other.
+func (p *Planner) NoteToolLoop(expID int64) {
+	p.loopHint.Store(true)
+	if expID > 0 {
+		p.ResetTodos(expID)
+	}
+}
+
+func (p *Planner) takeLoopHint() bool { return p.loopHint.Swap(false) }
+
 func (p *Planner) compactionWindow() int {
 	if p.windowFn != nil {
 		return p.windowFn()
@@ -108,12 +172,27 @@ func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || 
 func (p *Planner) todoFor(expID int64) *actool.TodoStore {
 	p.todoMu.Lock()
 	defer p.todoMu.Unlock()
+	if p.todos == nil {
+		p.todos = map[int64]*actool.TodoStore{}
+	}
 	s := p.todos[expID]
 	if s == nil {
 		s = actool.NewTodoStore()
 		p.todos[expID] = s
 	}
 	return s
+}
+
+// ResetTodos replaces the task's persistent planning todo with a fresh store.
+// A loop-aborted round may have left the model a stale list that it keeps
+// replaying; clearing it lets the next round start from the real situation.
+func (p *Planner) ResetTodos(expID int64) {
+	p.todoMu.Lock()
+	if p.todos == nil {
+		p.todos = map[int64]*actool.TodoStore{}
+	}
+	p.todos[expID] = actool.NewTodoStore()
+	p.todoMu.Unlock()
 }
 
 // SetKillWork wires the engine's per-work terminate callback so the planner's
@@ -126,20 +205,35 @@ func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.st
 
 // renderPlannerTodos formats the persistent planning todo for injection into the
 // wake-up prompt (empty when there are no todos yet — first wake-up).
+const (
+	plannerTodoCap     = 50
+	plannerTodoRunes   = 300
+	triggerDetailRunes = 600
+)
+
 func renderPlannerTodos(items []actool.Todo) string {
 	if len(items) == 0 {
 		return ""
 	}
+	shown := items
+	truncated := 0
+	if len(shown) > plannerTodoCap {
+		truncated = len(shown) - plannerTodoCap
+		shown = shown[:plannerTodoCap]
+	}
 	var b strings.Builder
 	b.WriteString("\n\n【你的规划待办（跨唤醒保留，上一轮你写的）】：\n")
-	for _, it := range items {
+	for _, it := range shown {
 		mark := map[actool.TodoStatus]string{actool.TodoPending: "☐", actool.TodoInProgress: "▶", actool.TodoCompleted: "✔"}[it.Status]
 		if mark == "" {
 			mark = "☐"
 		}
-		b.WriteString(fmt.Sprintf("  %s %s\n", mark, it.Content))
+		b.WriteString(fmt.Sprintf("  %s %s\n", mark, truncRunes(it.Content, plannerTodoRunes)))
 	}
-	b.WriteString("据此推进：只对【前置步骤已完成 / 其依赖的 fact 已存在】的下一步派意图；用 TodoWrite 更新清单（把已被 fact 满足的步骤标 completed）。不要重复派已在清单里 pending/in_progress 的步骤。")
+	if truncated > 0 {
+		b.WriteString(fmt.Sprintf("  …（另有 %d 条待办未显示，请保持清单精简）\n", truncated))
+	}
+	b.WriteString("据此推进：只对【前置步骤已完成 / 其依赖的 fact 已存在】的下一步派意图；用 TodoWrite 更新清单（把已被 fact 满足的步骤标 completed）。不要重复派已在清单里 pending/in_progress 的步骤。TodoWrite 最多保留 50 条、每条不超过 300 字。")
 	return b.String()
 }
 
@@ -166,6 +260,17 @@ type TriggerEvent struct {
 	Hints    []string // Kind=="hint" 专用：本次 add_hint 新增的提示文本（1 条或多条）
 }
 
+func truncList(in []string, n int) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = truncRunes(s, n)
+	}
+	return out
+}
+
 // renderTriggers spells out the change(s) that fired this round: for a finished
 // worker — which intent + its output conclusion; for a finding — which intent +
 // what was found. Empty for time/heartbeat wakes. Reads the store (best-effort;
@@ -179,30 +284,32 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 	for _, ev := range evs {
 		switch ev.Kind {
 		case "goal":
-			if len(ev.Goals) == 1 {
-				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了一个目标：%s —— 新的待达成目标，请据此补充探索方向（若尚无对应意图）。", ev.Goals[0]))
+			goals := truncList(ev.Goals, triggerDetailRunes)
+			if len(goals) == 1 {
+				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了一个目标：%s —— 新的待达成目标，请据此补充探索方向（若尚无对应意图）。", goals[0]))
 			} else {
-				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了 %d 个目标：%s —— 均为新的待达成目标，请逐一为尚无对应意图的目标补充探索方向。", len(ev.Goals), strings.Join(ev.Goals, "；")))
+				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了 %d 个目标：%s —— 均为新的待达成目标，请逐一为尚无对应意图的目标补充探索方向。", len(goals), strings.Join(goals, "；")))
 			}
 		case "hint":
-			if len(ev.Hints) == 1 {
-				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了一条战略提示：%s —— 已挂到探索图上，请据此调整/补充探索方向（若尚无对应意图）。", ev.Hints[0]))
+			hints := truncList(ev.Hints, triggerDetailRunes)
+			if len(hints) == 1 {
+				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了一条战略提示：%s —— 已挂到探索图上，请据此调整/补充探索方向（若尚无对应意图）。", hints[0]))
 			} else {
-				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了 %d 条战略提示：%s —— 均已挂到探索图上，请逐一据此调整/补充探索方向。", len(ev.Hints), strings.Join(ev.Hints, "；")))
+				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了 %d 条战略提示：%s —— 均已挂到探索图上，请逐一据此调整/补充探索方向。", len(hints), strings.Join(hints, "；")))
 			}
 		case "goal_deleted":
-			b.WriteString(fmt.Sprintf("\n- 人删除了该目标：%s —— 该目标已移除，请据此重判剩余目标/方向（不必再为它派意图）。", ev.Detail))
+			b.WriteString(fmt.Sprintf("\n- 人删除了该目标：%s —— 该目标已移除，请据此重判剩余目标/方向（不必再为它派意图）。", truncRunes(ev.Detail, triggerDetailRunes)))
 		case "goal_edited":
-			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", ev.OldGoal, ev.NewGoal))
+			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", truncRunes(ev.OldGoal, triggerDetailRunes), truncRunes(ev.NewGoal, triggerDetailRunes)))
 		case "finding":
-			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
+			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), truncRunes(ev.Detail, triggerDetailRunes)))
 		case "cancelled":
 			// 意图内容优先用删除时捕获的 Summary（真删除后节点已不存在，intentSummary 查不到）。
 			sm := ev.Summary
 			if sm == "" {
 				sm = intentSummary(ts, ev.IntentID)
 			}
-			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, sm, ev.Detail))
+			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, truncRunes(sm, triggerDetailRunes), truncRunes(ev.Detail, triggerDetailRunes)))
 		default: // "done"
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), workerOutput(ts, ev.IntentID)))
 			if fids := factIDsYielded(ts, ev.IntentID); fids != "" {
@@ -238,7 +345,7 @@ func intentSummary(ts *db.ExplorationStore, id int64) string {
 	var p map[string]any
 	if json.Unmarshal(n.Payload, &p) == nil {
 		if s, ok := p["summary"].(string); ok && s != "" {
-			return s
+			return truncRunes(s, triggerDetailRunes)
 		}
 	}
 	return "?"
@@ -272,11 +379,7 @@ func workerOutput(ts *db.ExplorationStore, id int64) string {
 // truncOutput caps a worker-output blob so the trigger context doesn't bloat the
 // system prompt every round; full text is one get_worker_output call away.
 func truncOutput(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + " …（已截断，完整见 get_worker_output）"
+	return truncateRunes(s, n, " …（已截断，完整见 get_worker_output）")
 }
 
 // renderGraphOverview folds the pre-computed graph_overview snapshot into the
@@ -359,6 +462,17 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
 func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
+	// Hard wall-clock bound for the WHOLE round. The SDK's MaxDuration only bounds
+	// toolCtx and is checked at turn boundaries; an in-flight model stream keeps
+	// running on the parent ctx (harness/query.go). That is exactly how one planner
+	// Plan() once spent ~2h looping on identical TodoWrite turns. This child ctx is
+	// still derived from the engine's ctx, so pause/kill/shutdown cancel immediately.
+	tc := taskClockFrom(ctx)
+	soft, clamped := clampMaxDuration(tc.DeadlineUnix, p.runBudget())
+	runCtx, cancel := withHardRunTimeout(ctx, soft)
+	defer cancel()
+	ctx = runCtx
+
 	// cold-digest §2.3/§7: advance this task's planner-round counter, maintain the
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
 	// compaction. Synchronous part is cheap (a few queries); the LLM compaction
@@ -390,7 +504,6 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
-	tc := taskClockFrom(ctx)
 	if tc.Final {
 		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
 	}
@@ -402,12 +515,17 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
 	system, boundary := deferredSystem(sysBody, def)
-	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
-	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
+	// 软预算 soft 已在入口按 run_budget + 任务 deadline 夹逼(见上方)。SDK 在轮边界命中
+	// 它后进收尾；入口的硬 ctx 再兜底卡住的模型流/收尾。
 	settle := wrapupSettlement("planner", nil)
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
+	}
+	// 0=unlimited 的配置在 planner 上等于"永远不停"：一次退化循环就能跑几十轮。这里给
+	// 一个兜底轮数上限；正常一轮只有几步，不受影响。
+	maxTurns := p.maxTurns
+	if maxTurns <= 0 || maxTurns > plannerTurnCeiling {
+		maxTurns = plannerTurnCeiling
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,
@@ -433,8 +551,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(taskDir),
-		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
-		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
+		MaxTurns:              maxTurns, // 0=unlimited 已被 plannerTurnCeiling 兜底
+		MaxDuration:           soft,     // 软墙钟预算(任务 deadline 更紧时取剩余)
 		Compaction:            compactionConfig(p.compactionWindow()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
@@ -466,9 +584,13 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		}
 	}
 	input := lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。**硬底线：只要目标尚未达成、且当前没有任何 open 或 running 意图（frontier_open=0 且 running_intents 为空），本轮就必须产出至少一个向目标推进的意图——此时没有在跑的 work 可等、也没有在排队的方向，产出 0 意图=任务停摆。仅当已有 open/running 意图在推进、或目标已达成时，本轮才可以不产出新意图。**" +
+		"\n\n【反空转】本轮若不需要新增意图，判完目标就**直接结束**：不要用 TodoWrite 反复刷新同一份没有变化的清单，也不要把相同内容重复输出。TodoWrite 只在待办确实变化时调用一次；重复调用相同的 TodoWrite 不会推进任何工作。" +
 		renderPlannerTodos(opts.Todos.List())
-	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
-	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。
+	if p.takeLoopHint() {
+		input += "\n\n【上一轮被循环保护中止】你上一轮连续多次调用了完全相同的工具（通常是重复写同一份 TodoWrite）。本轮禁止重放那个调用：没有新方向就直接结束；要更新待办就写出实际发生变化的内容。"
+	}
+	// 软预算 MaxDuration 在轮边界命中后进收尾；入口的硬 ctx(soft+runSettleGrace)再兜底
+	// 卡住的模型流/收尾。ctx 同时承载 pause / kill / shutdown。
 	_, _, err = captureRun(ctx, opts, input,
 		func(r db.Activity) {
 			if emit != nil {

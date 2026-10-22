@@ -30,7 +30,8 @@ func taskClockFrom(ctx context.Context) TaskClock {
 }
 
 // clampMaxDuration folds a task deadline into a run's own wall-clock budget.
-//   - ownBudget = the agent's own run_seconds (0 = unlimited).
+//   - ownBudget = the agent's own run_seconds (0 = no configured budget; callers
+//     apply their own fallback ceiling before passing it here).
 //   - Returns eff = the MaxDuration to use (floored at 1s so we never pass ≤0, which
 //     harness reads as "unlimited"), and clamped = whether the TASK deadline is the
 //     binding constraint (remaining ≤ ownBudget, or ownBudget unlimited). When there

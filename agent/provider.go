@@ -418,8 +418,15 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 	}
 	// ResponseHeaderTimeout prevents artex from blocking forever when the local
 	// LLM server accepts the connection but never returns a response (e.g. vLLM
-	// KV-cache exhaustion causing requests to queue indefinitely).
+	// KV-cache exhaustion causing requests to queue indefinitely). This only
+	// covers the wait for headers: a stream that stalls after headers, or a model
+	// that keeps completing one successful turn after another in a loop, is NOT
+	// covered here. The agent run's hard context deadline + tool-loop guard is
+	// the backstop for those.
 	transport.ResponseHeaderTimeout = 10 * time.Minute
+	// Fail fast on a broken TCP/TLS handshake instead of tying up a worker slot.
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ExpectContinueTimeout = 1 * time.Second
 	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
 }
 

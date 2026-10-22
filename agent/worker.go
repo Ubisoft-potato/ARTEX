@@ -142,8 +142,10 @@ func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn 
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
 
 // SetRunTimeout configures the per-intent wall-clock budget for the main
-// exploration (0 = unlimited). When it fires, the SDK settlement phase still runs
-// so facts are never lost to a timeout. Safe to call before Execute.
+// exploration. 0 means "no configured budget"; Execute applies
+// defaultWorkerRunCeiling instead of allowing an unbounded run. When it fires,
+// the SDK settlement phase still runs so facts are never lost to a timeout.
+// Safe to call before Execute.
 func (w *Worker) SetRunTimeout(run time.Duration) {
 	w.runTimeout = run
 }
@@ -473,6 +475,15 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
+	// run_seconds=0 means "no configured budget", not "can hang forever". A
+	// generous ceiling keeps a stuck run bounded while still allowing long work.
+	effectiveRun := effectiveRunBudget(maxDur, defaultWorkerRunCeiling)
+	// Hard backstop for the whole run: the SDK's MaxDuration only bounds toolCtx and
+	// is checked at turn boundaries, so a stuck model stream never reaches it. This
+	// child ctx aborts such a stream at budget+grace; the engine's ctx still cancels
+	// immediately on pause/kill/shutdown.
+	ctx, cancel := withHardRunTimeout(ctx, effectiveRun)
+	defer cancel()
 	settle := wrapupSettlement("worker", []string{"Bash"})
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
@@ -512,9 +523,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
 		MaxTurns:   effectiveMaxTurns, // probe 模式上限 probeMaxTurns；exploit/默认用配置值(0=不限)
-		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
-		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
-		MaxDuration: maxDur,
+		// 墙钟预算,轮边界判,不打断半路;0配置会被上面的 effectiveRun 兜底成大上限。
+		// 有任务级 deadline 时夹逼到 min(自身预算,距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
+		MaxDuration: effectiveRun,
 		// 命中预算(轮次 OR 时长)→ SDK 跑一轮收尾(隐藏 Bash),把已识别的写回,避免烂尾。
 		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
@@ -585,10 +596,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 
 	// Budgets + settlement are owned by the SDK (MaxTurns/MaxDuration + Settlement):
 	// on hit it runs a wrap-up turn and finishes with ReasonMaxTurns/ReasonTimeout.
-	// MaxDuration now interrupts an in-flight tool at the wall-clock deadline and
-	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
-	// still settles (no external hard-timeout backstop needed). ctx itself carries only
-	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
+	// MaxDuration bounds toolCtx and is checked at the turn boundary; the hard ctx
+	// derived above is the backstop for a model stream that stalls mid-flight, and
+	// keeps the run bounded even if settlement itself hangs. The parent ctx still
+	// carries pause / planner kill / shutdown, which the engine distinguishes and
+	// re-queues/stops.
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
 	return reason, tsx.Writes(), err
 }

@@ -379,6 +379,44 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 		})
 }
 
+// findingOverviewCap bounds how many findings are inlined into graph_overview.
+// The planner judges goals from the count; the full list stays one list_findings
+// call away. This keeps the pre-injected situation payload from growing without
+// bound on finding-heavy tasks.
+const findingOverviewCap = 100
+
+// findingPocRunes bounds each finding's PoC preview in graph_overview. A real PoC
+// can be kilobytes of copied HTTP; the planner only needs enough to recognise
+// the evidence, and list_findings/node_detail still return the full text.
+const findingPocRunes = 400
+
+const (
+	findingSummaryRunes = 500
+	findingAssetCap     = 20
+	findingAssetRunes   = 200
+	overviewTextRunes   = 500
+)
+
+// truncateRunes caps s to n runes without allocating a full []rune copy. The
+// suffix is appended only when truncation actually happened.
+func truncateRunes(s string, n int, suffix string) string {
+	if n <= 0 {
+		return ""
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i] + suffix
+		}
+		count++
+	}
+	return s
+}
+
+func truncRunes(s string, n int) string {
+	return truncateRunes(s, n, " …")
+}
+
 // graphOverviewData computes the distilled situational snapshot shared by the
 // graph_overview tool and the planner's wake-up prompt (which pre-injects it so
 // the model needn't spend a turn calling the tool — every plan round starts with
@@ -391,7 +429,8 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, g := range goals {
 		var p map[string]any
 		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		text, _ := p["text"].(string)
+		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": truncRunes(text, overviewTextRunes)})
 	}
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
@@ -401,7 +440,8 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		text, _ := p["text"].(string)
+		hint := map[string]any{"id": h.ID, "state": h.State, "text": truncRunes(text, overviewTextRunes)}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -474,8 +514,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
 	out["findings"] = len(vulnNodes)                   // 确认漏洞数（目标判定看它）
 	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
-	// findings 是任务里最高价值的产物、单任务通常也不多 → 直接全量带进概览（不像 facts 那样
+	// findings 是任务里最高价值的产物、单任务通常也不多 → 直接带进概览（不像 facts 那样
 	// 只给最近窗口），让 planner 每轮判目标时一眼看全所有确认漏洞，无需再调 list_findings。
+	// 但概览会随每轮 planner 输入预注入，必须防无界膨胀：最多 findingOverviewCap 条，每条
+	// evidence 只给前 findingPocRunes 个字符（完整 PoC 仍可 list_findings / node_detail 取）。
 	// 每条只留 {id, summary, evidence?, from_intent?, assets?}：evidence 是 report_finding 的
 	// PoC 文本（payload.evidence.poc）；from_intent 是产生本漏洞的意图；assets 直接给受影响资产
 	// 的可读内容（url/域名/ip:port 等，不再是裸 id）——锚定关系存于 exploration_anchors、经 findings
@@ -502,25 +544,37 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			}
 		}
 	}
+	if len(vulnNodes) > findingOverviewCap {
+		out["finding_list_truncated"] = true
+	}
 	findingList := make([]map[string]any, 0, len(vulnNodes))
-	for _, n := range vulnNodes {
+	for i, n := range vulnNodes {
+		if i >= findingOverviewCap {
+			break
+		}
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
-		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		summary, _ := fp["summary"].(string)
+		m := map[string]any{"id": n.ID, "summary": truncRunes(summary, findingSummaryRunes)}
 		if ev, ok := fp["evidence"].(map[string]any); ok {
 			if poc, ok := ev["poc"].(string); ok && poc != "" {
-				m["evidence"] = poc
+				m["evidence"] = truncRunes(poc, findingPocRunes)
 			}
 		}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本漏洞由哪个意图产生
 		}
 		if meta, ok := findingMeta[n.ID]; ok && len(meta.AssetIDs) > 0 {
-			assets := make([]string, 0, len(meta.AssetIDs))
-			for _, aid := range meta.AssetIDs {
+			ids := meta.AssetIDs
+			if len(ids) > findingAssetCap {
+				ids = ids[:findingAssetCap]
+				m["assets_truncated"] = true
+			}
+			assets := make([]string, 0, len(ids))
+			for _, aid := range ids {
 				if a := assetByID[aid]; a != nil {
 					if v := assetValue(a); v != "" {
-						assets = append(assets, v)
+						assets = append(assets, truncRunes(v, findingAssetRunes))
 						continue
 					}
 				}
@@ -1196,7 +1250,7 @@ type intentItem struct {
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
 	DependsOn []json.RawMessage `json:"depends_on"` // intent node ids that must be done before this enters frontier
-	Mode      string            `json:"mode"`        // "probe"=快速验证可行性(限额 turns) | "exploit"=深度利用(默认)
+	Mode      string            `json:"mode"`       // "probe"=快速验证可行性(限额 turns) | "exploit"=深度利用(默认)
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1276,7 +1330,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
 			"depends_on": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "前置意图 id 列表（可选）：只有列表中每个意图都变为 done 状态后，本意图才会进入 frontier 被 Worker 领取。用于声明「先拿到凭据（意图 A），再横向移动（本意图）」这类顺序利用链。只能引用意图(intent)节点 id；顶层独立方向请留空。"},
-			"mode": map[string]any{"type": "string", "enum": []string{"probe", "exploit"}, "description": "执行模式（默认 exploit）。probe=探索/快速验证可行性：Worker 用极短 turn 预算（≤12 轮）判断方向是否值得深挖，得到初步结论即写 fact 并停止，不穷举绕过；适合「不确定目标是否存在/可达/可利用」的新方向。exploit=深度利用：Worker 用完整预算、穷举绕过手段，适合已有 probe 确认信号的方向。建议流程：先 probe → 若 fact confidence=high/observed 再用 depends_on 链接一条 exploit 意图。"},
+			"mode":       map[string]any{"type": "string", "enum": []string{"probe", "exploit"}, "description": "执行模式（默认 exploit）。probe=探索/快速验证可行性：Worker 用极短 turn 预算（≤12 轮）判断方向是否值得深挖，得到初步结论即写 fact 并停止，不穷举绕过；适合「不确定目标是否存在/可达/可利用」的新方向。exploit=深度利用：Worker 用完整预算、穷举绕过手段，适合已有 probe 确认信号的方向。建议流程：先 probe → 若 fact confidence=high/observed 再用 depends_on 链接一条 exploit 意图。"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2389,10 +2443,10 @@ func (t *ToolSet) coverageMatrix() actool.CoreTool {
 
 			// ── 4. top_gaps: assets with most missing categories ──────────────
 			type gapEntry struct {
-				AssetID   int64    `json:"asset_id"`
-				Covered   []string `json:"covered"`
-				Missing   []string `json:"missing"`
-				MissingN  int      `json:"-"`
+				AssetID  int64    `json:"asset_id"`
+				Covered  []string `json:"covered"`
+				Missing  []string `json:"missing"`
+				MissingN int      `json:"-"`
 			}
 			var gaps []gapEntry
 			for aid, covered := range assetCovered {

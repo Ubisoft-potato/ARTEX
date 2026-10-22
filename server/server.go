@@ -148,7 +148,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile: map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
@@ -303,7 +303,9 @@ func (s *Server) agentMaxTurns(key string) int {
 }
 
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
-// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// agent key. 0 means "no configured budget"; the agent applies its own fallback
+// ceiling (worker 2h / chat 1h / planner 10m). 1200 is the schema fallback when
+// there is no DB or no row.
 func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
 		return 1200

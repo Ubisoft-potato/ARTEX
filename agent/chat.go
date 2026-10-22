@@ -108,6 +108,9 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	if !webSearch {
 		ws.Enabled = false
 	}
+	// 0 means "no configured budget", but the run still gets a generous ceiling
+	// and a hard ctx so a stalled provider cannot hang the conversation forever.
+	effectiveRun := effectiveRunBudget(maxDuration, defaultChatRunCeiling)
 
 	// Per-session working directory: <workDir>/sessions/<sessionID>/
 	// Isolates file writes across conversations, mirroring how workers use i<intentID>/.
@@ -148,7 +151,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            sessionWorkDir,
 		MaxTurns:              maxTurns,
-		MaxDuration:           maxDuration,
+		MaxDuration:           effectiveRun,
 		Compaction:            compactionConfig(c.window),
 		Todos:                 actool.NewTodoStore(),
 		// large tool output spills to cmd-output/ under the session dir.
@@ -180,7 +183,9 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
+	runCtx, cancelRun := withHardRunTimeout(ctx, effectiveRun)
+	defer cancelRun()
+	text, _, err := captureRunSession(runCtx, s, message, func(r db.Activity) {
 		if emit != nil {
 			r.Worker = agentKey
 			emit(r)

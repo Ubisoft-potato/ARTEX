@@ -29,3 +29,16 @@ func TestOverviewTextBudgetIsFairAndUTF8Safe(t *testing.T) {
 		t.Fatalf("exhausted budget returned more text: %q", tail)
 	}
 }
+
+func TestTruncRunes(t *testing.T) {
+	if got := truncRunes("short", 10); got != "short" {
+		t.Fatalf("short string changed: %q", got)
+	}
+	got := truncRunes(strings.Repeat("中", findingPocRunes+10), findingPocRunes)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation produced invalid UTF-8: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n > findingPocRunes+3 {
+		t.Fatalf("truncated preview still too long: %d runes", n)
+	}
+}

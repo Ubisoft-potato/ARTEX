@@ -315,9 +315,16 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                         value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
                     </div>
                     <div className="grid gap-1.5">
-                      <Label htmlFor="run-seconds" className="text-xs">运行时长（秒，0=不限）</Label>
+                      <Label htmlFor="run-seconds" className="text-xs">运行时长（秒，0=自动兜底）</Label>
                       <Input id="run-seconds" type="number" min={0} className="h-8 w-32"
                         value={runSecs} onChange={(e) => setRunSecs(e.target.value)} />
+                      <span className="text-muted-foreground max-w-xs text-xs">
+                        {agentKey === "planner"
+                          ? "0 = 默认 8 分钟；单轮配置再大也最多 10 分钟"
+                          : agentKey === "worker"
+                            ? "0 = 2 小时兜底；任务级 deadline 更早时以任务为准"
+                            : "0 = 1 小时兜底"}
+                      </span>
                     </div>
                   </>
                 )}
