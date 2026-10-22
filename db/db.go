@@ -162,7 +162,7 @@ type builtinAgent struct {
 	key, name, role, desc string
 	vars                  []promptVar
 	interactiveShell      bool // 建行时的默认交互式 shell 开关；ON CONFLICT 不覆盖用户后续手动开关
-	runSeconds            *int // 建行时的单次 run 墙钟上限(秒)；nil=用种子默认(1200)，0=不限时
+	runSeconds            *int // 建行时的单次 run 墙钟上限(秒)；nil=用种子默认(0=未显式配置，按角色兜底)
 }
 
 type promptVar struct{ name, desc, example, source string }
@@ -204,7 +204,7 @@ func (d *DB) seedBuiltins() error {
 		var agentID int64
 		err := d.QueryRow(`
 INSERT INTO agents(key, name, description, role, builtin, enabled, interactive_shell, run_seconds)
-VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 1200))
+VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 0))
 ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description
 RETURNING id`, a.key, a.name, a.desc, a.role, a.interactiveShell, a.runSeconds).Scan(&agentID)
 		if err != nil {
@@ -219,6 +219,20 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 				agentID, v.name, v.desc, v.example, v.source); err != nil {
 				return fmt.Errorf("agent %s var %s: %w", a.key, v.name, err)
 			}
+		}
+	}
+	// One-time: the historical default was 1200s. New semantics treat 0 as
+	// "no explicit budget" and let each role apply its own fallback ceiling
+	// (worker 2h / chat 1h / planner 8m, capped at 10m). Migrate system agents
+	// still sitting on the old default; the settings flag keeps a later explicit
+	// 1200 (or any user choice) from being overwritten on restart.
+	if v, _, _ := d.GetSetting("agent_run_seconds_zero_v1"); v != "true" {
+		if _, err := d.Exec(`UPDATE agents SET run_seconds=0
+			WHERE run_seconds=1200 AND (builtin OR key IN ('reporter','retester'))`); err != nil {
+			return fmt.Errorf("migrate run_seconds default: %w", err)
+		}
+		if err := d.SetSetting("agent_run_seconds_zero_v1", "true"); err != nil {
+			return fmt.Errorf("mark run_seconds migration: %w", err)
 		}
 	}
 	// Drop catalog entries for variables that were renamed, so the white-list no

@@ -51,7 +51,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [skillVisible, setSkillVisible] = React.useState<string[]>([]);
   const [preview, setPreview] = React.useState("");
   const [maxTurns, setMaxTurns] = React.useState("0");
-  const [runSecs, setRunSecs] = React.useState("600");
+  const [runSecs, setRunSecs] = React.useState("0");
   // "" = 跟随(未绑定)；否则为 profile id 字符串
   const [llmProfileId, setLlmProfileId] = React.useState("");
   const [llmProfiles, setLlmProfiles] = React.useState<NonNullable<AgentDetail["llm_profiles"]>>([]);
@@ -90,7 +90,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setMcpVisible(d.visibility?.mcp ?? []);
         setSkillVisible(d.visibility?.skill ?? []);
         setMaxTurns(String(d.agent?.max_turns ?? 0));
-        setRunSecs(String(d.agent?.run_seconds ?? 600));
+        setRunSecs(String(d.agent?.run_seconds ?? 0));
         setLlmProfileId(d.agent?.llm_profile_id != null ? String(d.agent.llm_profile_id) : "");
         setLlmProfiles(d.llm_profiles ?? []);
         setWebSearch(!!d.agent?.web_search);

@@ -304,15 +304,16 @@ func (s *Server) agentMaxTurns(key string) int {
 
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
 // agent key. 0 means "no configured budget"; the agent applies its own fallback
-// ceiling (worker 2h / chat 1h / planner 10m). 1200 is the schema fallback when
-// there is no DB or no row.
+// ceiling (worker 2h / chat 1h / planner 8m, capped at 10m). The same 0 is
+// returned when there is no DB or no row, so a missing config uses the fallback
+// rather than a stale hard-coded value.
 func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
-		return 1200
+		return 0
 	}
 	a, err := s.m.pg.GetAgentByKey(key)
 	if err != nil || a == nil {
-		return 1200
+		return 0
 	}
 	return a.RunSecs
 }
