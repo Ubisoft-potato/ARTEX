@@ -2337,197 +2337,31 @@ func classifyCategories(summary string) []string {
 	return cats
 }
 
-// coverageMatrix builds an attack-surface coverage matrix for the current task.
-// It reads all intents from the exploration graph, classifies each by attack
-// category via keyword scan, and aggregates by (asset_id × category).
-// Returns the top uncovered gaps so the Planner can prioritise intent generation.
+// coverageMatrix builds an evidence-aware attack-surface coverage matrix for the
+// current task. It classifies intents with the legacy keyword taxonomy, but only
+// observed facts/findings close a cell; open/running work is in-flight and
+// exhausted/blocked work is debt. Categories are filtered by asset applicability,
+// and the denominator is every in-scope asset, not just assets with an intent.
 func (t *ToolSet) coverageMatrix() actool.CoreTool {
 	return readTool("coverage_matrix",
-		"生成本任务的攻击面覆盖矩阵：对每个已被意图关联的资产，统计哪些攻击类别已有意图覆盖（open/running/done 均算计划中）、哪些仍是空白。\n"+
-			"返回：coverage_pct（覆盖格子占比）、category_coverage（各类别已覆盖资产数）、top_gaps（空白最多的资产及缺失类别，优先派意图补这里）、zero_targeted_assets（范围内完全没有意图关联的资产）。\n"+
-			"建议每轮规划前调一次，识别系统性空白，防止覆盖不均。",
+		"生成本任务的攻击面覆盖矩阵：按“范围内资产 × 适用攻击类别”统计。只有 observed 事实或 finding 算已验证覆盖；open/running 是在途，exhausted/blocked 是债务，都不能算已覆盖。\n"+
+			"类别会按资产类型/服务过滤（例如 SSH 不会缺 XSS/SSRF/业务逻辑），避免不适用类别占据 top_gaps。\n"+
+			"返回：coverage_pct（已验证格子占比）、category_coverage（各类别适用/已覆盖/在途/债务/未测资产数）、top_gaps（缺失最多且风险较高的资产+缺失类别）、zero_targeted_count/assets（范围内完全没有意图关联的资产）。\n"+
+			"建议每轮规划前调一次，识别系统性空白；深度信号仍优先于铺面。",
 		obj(map[string]any{
-			"top_n": intp("返回 top_gaps 的资产数（默认 8）"),
+			"top_n": intp("返回 top_gaps 的资产数（默认 8，最多 50）"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			if t.ts == nil {
-				return actool.Errorf("coverage_matrix 需要任务上下文"), nil
-			}
 			var a struct {
 				TopN int `json:"top_n"`
 			}
 			_ = json.Unmarshal(in, &a)
-			if a.TopN <= 0 {
-				a.TopN = 8
-			}
-
-			// ── 1. load all intents ───────────────────────────────────────────
-			allIntents, err := t.ts.ListByKind(db.KindIntent, 500)
+			out, err := t.buildCoverageMatrix(a.TopN)
 			if err != nil {
-				return actool.Errorf("读取意图失败: " + err.Error()), nil
+				return actool.Errorf(err.Error()), nil
 			}
-
-			// ── 2. build asset → covered-categories map ───────────────────────
-			// assetCovered[assetID][category] = true
-			assetCovered := map[int64]map[string]bool{}
-			// categoryCoveredAssets[cat] = set of asset IDs covered
-			catAssets := map[string]map[int64]bool{}
-			globalCats := map[string]bool{} // categories from intents with no asset_ids
-			totalIntents := 0
-
-			for _, n := range allIntents {
-				var p map[string]any
-				if err := json.Unmarshal(n.Payload, &p); err != nil {
-					continue
-				}
-				summary, _ := p["summary"].(string)
-				cats := classifyCategories(summary)
-				if len(cats) == 0 {
-					totalIntents++
-					continue
-				}
-				totalIntents++
-
-				// collect asset_ids from payload
-				var assetIDs []int64
-				if raw, ok := p["asset_ids"]; ok {
-					switch v := raw.(type) {
-					case []any:
-						for _, x := range v {
-							switch id := x.(type) {
-							case float64:
-								assetIDs = append(assetIDs, int64(id))
-							case int64:
-								assetIDs = append(assetIDs, id)
-							}
-						}
-					}
-				}
-
-				if len(assetIDs) == 0 {
-					// global intent (no specific asset) — mark in global bucket
-					for _, c := range cats {
-						globalCats[c] = true
-					}
-					continue
-				}
-				for _, aid := range assetIDs {
-					if assetCovered[aid] == nil {
-						assetCovered[aid] = map[string]bool{}
-					}
-					for _, c := range cats {
-						assetCovered[aid][c] = true
-						if catAssets[c] == nil {
-							catAssets[c] = map[int64]bool{}
-						}
-						catAssets[c][aid] = true
-					}
-				}
-			}
-
-			// ── 3. category coverage summary ──────────────────────────────────
-			nCats := len(attackCategories)
-			type catStat struct {
-				Key   string `json:"key"`
-				Name  string `json:"name"`
-				Count int    `json:"assets_covered"` // assets with ≥1 intent in this cat
-			}
-			catStats := make([]catStat, 0, nCats)
-			for _, cat := range attackCategories {
-				catStats = append(catStats, catStat{
-					Key:   cat.Key,
-					Name:  cat.Name,
-					Count: len(catAssets[cat.Key]),
-				})
-			}
-
-			// ── 4. top_gaps: assets with most missing categories ──────────────
-			type gapEntry struct {
-				AssetID  int64    `json:"asset_id"`
-				Covered  []string `json:"covered"`
-				Missing  []string `json:"missing"`
-				MissingN int      `json:"-"`
-			}
-			var gaps []gapEntry
-			for aid, covered := range assetCovered {
-				var covList, missList []string
-				for _, cat := range attackCategories {
-					if covered[cat.Key] {
-						covList = append(covList, cat.Key)
-					} else {
-						missList = append(missList, cat.Key)
-					}
-				}
-				if len(missList) > 0 {
-					gaps = append(gaps, gapEntry{
-						AssetID:  aid,
-						Covered:  covList,
-						Missing:  missList,
-						MissingN: len(missList),
-					})
-				}
-			}
-			// sort by most missing first
-			for i := 1; i < len(gaps); i++ {
-				for j := i; j > 0 && gaps[j].MissingN > gaps[j-1].MissingN; j-- {
-					gaps[j], gaps[j-1] = gaps[j-1], gaps[j]
-				}
-			}
-			if len(gaps) > a.TopN {
-				gaps = gaps[:a.TopN]
-			}
-
-			// ── 5. coverage percentage ────────────────────────────────────────
-			nAssets := len(assetCovered)
-			totalCells := nAssets * nCats
-			coveredCells := 0
-			for _, covered := range assetCovered {
-				coveredCells += len(covered)
-			}
-			pct := 0
-			if totalCells > 0 {
-				pct = coveredCells * 100 / totalCells
-			}
-
-			// ── 6. assets with zero intent targeting (from untested list) ─────
-			var zeroTargeted []map[string]any
-			if t.as != nil && t.taskID > 0 {
-				untested, _, _ := t.as.ListUntestedAssetsWithSources(t.taskID, "", 20, 0)
-				for _, a := range untested {
-					if assetCovered[a.ID] == nil {
-						zeroTargeted = append(zeroTargeted, map[string]any{
-							"asset_id": a.ID,
-							"type":     a.Type,
-							"label":    a.Label,
-						})
-					}
-				}
-			}
-
-			summaryStr := fmt.Sprintf(
-				"%d 个资产已被意图关联 × %d 个攻击类别 = %d 格；已覆盖 %d 格（%d%%）；全局意图（无资产 id）已覆盖类别：%v",
-				nAssets, nCats, totalCells, coveredCells, pct, mapKeys(globalCats),
-			)
-
-			return jsonResult(map[string]any{
-				"summary":              summaryStr,
-				"total_intents":        totalIntents,
-				"assets_targeted":      nAssets,
-				"coverage_pct":         pct,
-				"category_coverage":    catStats,
-				"top_gaps":             gaps,
-				"zero_targeted_assets": zeroTargeted,
-			})
+			return jsonResult(out)
 		})
-}
-
-// mapKeys returns sorted keys of a bool map as a string slice.
-func mapKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
 
 // PlannerTools is the read + intent-generation + goal-judgement tool set.

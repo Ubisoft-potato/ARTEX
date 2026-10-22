@@ -151,6 +151,25 @@ FROM target GROUP BY target.type ORDER BY target.type`, taskID)
 	return cov, nil
 }
 
+// ListCoverageAssetsWithSources returns every asset in the current task's
+// declared scope plus assets anchored by the task or its direct sources. It is
+// the denominator source for coverage_matrix: unlike ListUntestedAssetsWithSources
+// it includes already-tested assets and carries the full asset row so the matrix
+// can apply per-type/service applicability rules.
+func (s *AssetStore) ListCoverageAssetsWithSources(taskID int64) ([]*Asset, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`WITH `+contextCoverageCTE+` `+assetSelectCols+`
+WHERE id IN (SELECT id FROM target)
+ORDER BY last_seen DESC, id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAssets(rows)
+}
+
 // ListUntestedAssetsWithSources is the direct-source-aware backlog query used
 // by inherited tasks. Source fact anchors remove assets from the backlog.
 func (s *AssetStore) ListUntestedAssetsWithSources(taskID int64, typ string, limit, offset int) ([]CoverageAsset, int, error) {
