@@ -2308,7 +2308,7 @@ func (t *ToolSet) coverageMatrix() actool.CoreTool {
 			}
 
 			// ── 1. load all intents ───────────────────────────────────────────
-			allIntents, err := t.ts.ListByKind(db.KindIntent, 3000)
+			allIntents, err := t.ts.ListByKind(db.KindIntent, 500)
 			if err != nil {
 				return actool.Errorf("读取意图失败: " + err.Error()), nil
 			}

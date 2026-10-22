@@ -416,6 +416,10 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
+	// ResponseHeaderTimeout prevents artex from blocking forever when the local
+	// LLM server accepts the connection but never returns a response (e.g. vLLM
+	// KV-cache exhaustion causing requests to queue indefinitely).
+	transport.ResponseHeaderTimeout = 10 * time.Minute
 	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
 }
 
