@@ -365,13 +365,20 @@ func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
 	if _, err := assets.AddAgentScope(grand.ID, "root_domain", grandDomain, "test", "agent"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, map[string]any{"summary": "tested source asset"}, 0, "confirmed", "worker", []int64{sourceTestedID}); err != nil {
+	observedFact := func(summary string) map[string]any {
+		return map[string]any{"summary": summary, "confidence": "observed", "evidence": "test evidence"}
+	}
+	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, observedFact("tested source asset"), 0, "confirmed", "worker", []int64{sourceTestedID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, map[string]any{"summary": "anchored-only source asset"}, 0, "confirmed", "worker", []int64{sourceAnchoredOnlyID}); err != nil {
+	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, observedFact("anchored-only source asset"), 0, "confirmed", "worker", []int64{sourceAnchoredOnlyID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exploration(grand.ExplorationID).AddNode(KindFact, map[string]any{"summary": "indirect tested asset"}, 0, "confirmed", "worker", []int64{grandID}); err != nil {
+	if _, err := d.Exploration(grand.ExplorationID).AddNode(KindFact, observedFact("indirect tested asset"), 0, "confirmed", "worker", []int64{grandID}); err != nil {
+		t.Fatal(err)
+	}
+	// A dismissed fact must not remove an asset from the backlog.
+	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, observedFact("dismissed source asset"), 0, "dismissed", "worker", []int64{sourceUntestedID}); err != nil {
 		t.Fatal(err)
 	}
 

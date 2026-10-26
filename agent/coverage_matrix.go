@@ -30,11 +30,8 @@ const (
 )
 
 type coverageCell struct {
-	state     string
-	priority  int
-	intentIDs []int64
-	positive  bool
-	inFlight  bool
+	state    string
+	priority int
 }
 
 type coverageCategoryCount struct {
@@ -59,9 +56,10 @@ type coverageGap struct {
 	Risk         int      `json:"risk"`
 }
 
-// buildCoverageMatrix is the read model behind coverage_matrix. It deliberately
-// keeps the existing 10-category keyword taxonomy (so current intents still
-// classify) but fixes three defects in the old implementation:
+// buildCoverageMatrix is the read model behind coverage_matrix. It prefers the
+// structured categories written by add_intent and falls back to the legacy
+// 10-category keyword taxonomy for old rows. It fixes three defects in the old
+// implementation:
 //
 //  1. open/running/done/exhausted are no longer all "covered": only observed
 //     facts/findings count, open/running is in-flight, exhausted/blocked is debt.
@@ -69,7 +67,52 @@ type coverageGap struct {
 //     assets that happened to have an intent.
 //  3. categories are filtered by asset type/service so an SSH host is not
 //     reported as missing XSS/SSRF/business-logic coverage.
+const coverageMaxTopN = 50
+
 func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
+	if topN <= 0 {
+		topN = 8
+	}
+	if topN > coverageMaxTopN {
+		topN = coverageMaxTopN
+	}
+	// Compute one full (top 50) snapshot per ToolSet/round, then slice top_gaps
+	// for the caller's top_n. A planner often asks for top_n=5 and top_n=10 in the
+	// same round; this keeps the second call from re-reading the whole graph.
+	t.coverageMu.Lock()
+	if base, ok := t.coverageCache[0]; ok {
+		t.coverageMu.Unlock()
+		return coverageMatrixForTopN(base, topN), nil
+	}
+	t.coverageMu.Unlock()
+
+	out, err := t.buildCoverageMatrixUncached(coverageMaxTopN)
+	if err != nil {
+		return nil, err
+	}
+	t.coverageMu.Lock()
+	if t.coverageCache == nil {
+		t.coverageCache = make(map[int]map[string]any)
+	}
+	t.coverageCache[0] = out
+	t.coverageMu.Unlock()
+	return coverageMatrixForTopN(out, topN), nil
+}
+
+func coverageMatrixForTopN(base map[string]any, topN int) map[string]any {
+	gaps, _ := base["top_gaps"].([]coverageGap)
+	if topN <= 0 || len(gaps) <= topN {
+		return base
+	}
+	out := make(map[string]any, len(base))
+	for k, v := range base {
+		out[k] = v
+	}
+	out["top_gaps"] = append([]coverageGap(nil), gaps[:topN]...)
+	return out
+}
+
+func (t *ToolSet) buildCoverageMatrixUncached(topN int) (map[string]any, error) {
 	if t.ts == nil {
 		return nil, fmt.Errorf("coverage_matrix 需要任务上下文")
 	}
@@ -148,14 +191,23 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 			_ = json.Unmarshal(n.Payload, &p)
 		}
 		summary, _ := p["summary"].(string)
-		cats := classifyCategories(summary)
+		cats := coverageIntentCategories(p)
+		if len(cats) == 0 {
+			// Backward compatibility: intents created before the structured
+			// categories field still classify by their summary keywords.
+			cats = classifyCategories(summary)
+		}
 		assetIDs := coveragePayloadAssetIDs(p)
 
 		// Target accounting is independent of category classification: an intent
-		// may be intentionally broad and not match a keyword.
-		for _, aid := range assetIDs {
-			if assetByID[aid] != nil {
-				targeted[aid] = true
+		// may be intentionally broad and not match a keyword. Stopped/deleted
+		// work no longer counts: otherwise an abandoned direction makes its assets
+		// disappear from zero_targeted even though nothing is actively covering it.
+		if coverageIntentTargets(n.State) {
+			for _, aid := range assetIDs {
+				if assetByID[aid] != nil {
+					targeted[aid] = true
+				}
 			}
 		}
 
@@ -171,7 +223,7 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 		}
 
 		hasEvidence, observed, finding := coverageIntentEvidence(n.ID, yields, factByID, findingByID)
-		cellState, priority, positive := coverageIntentState(n.State, hasEvidence, observed, finding)
+		cellState, priority, _ := coverageIntentState(n.State, hasEvidence, observed, finding)
 		if cellState == "" {
 			continue // stopped/deleted (and unknown states) do not claim coverage
 		}
@@ -189,11 +241,8 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 					cells[aid] = make(map[string]coverageCell)
 				}
 				mergeCoverageCell(cells[aid], cat, coverageCell{
-					state:     cellState,
-					priority:  priority,
-					intentIDs: []int64{n.ID},
-					positive:  positive,
-					inFlight:  cellState == coverageStateInFlight,
+					state:    cellState,
+					priority: priority,
 				})
 			}
 		}
@@ -201,6 +250,7 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 
 	categoryCounts := make(map[string]*coverageCategoryCount, len(attackCategories))
 	stateCounts := make(map[string]int)
+	var coveredAssets, inFlightAssets, debtAssets, inconclusiveAssets, untestedAssets int
 	gaps := make([]coverageGap, 0)
 
 	for _, a := range assets {
@@ -217,7 +267,7 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 			Covered: []string{},
 			Missing: []string{},
 		}
-		hasInFlight, hasDebt, hasInconclusive, hasCovered := false, false, false, false
+		hasInFlight, hasDebt, hasInconclusive, hasCovered, hasUntested := false, false, false, false, false
 
 		for _, cat := range attackCategories {
 			if !coverageCategoryApplies(a, cat.Key) {
@@ -256,8 +306,25 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 				gap.Missing = append(gap.Missing, cat.Key)
 			default:
 				cc.untested++
+				hasUntested = true
 				gap.Missing = append(gap.Missing, cat.Key)
 			}
+		}
+
+		if hasCovered {
+			coveredAssets++
+		}
+		if hasInFlight {
+			inFlightAssets++
+		}
+		if hasDebt {
+			debtAssets++
+		}
+		if hasInconclusive {
+			inconclusiveAssets++
+		}
+		if hasUntested {
+			untestedAssets++
 		}
 
 		if len(gap.Missing) == 0 {
@@ -303,11 +370,18 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 			"key":                 cat.Key,
 			"name":                cat.Name,
 			"applicable_assets":   count.applicable,
-			"assets_covered":      count.covered, // backwards-compatible field
+			"assets_covered":      count.covered, // backwards-compatible field (cells for this category)
 			"assets_in_flight":    count.inFlight,
 			"assets_debt":         count.debt,
 			"assets_inconclusive": count.inconclusive,
 			"assets_untested":     count.untested,
+			// Explicit cell aliases: summing assets_* across categories counts
+			// cells, not unique assets. These names make that contract obvious.
+			"covered_cells":      count.covered,
+			"in_flight_cells":    count.inFlight,
+			"debt_cells":         count.debt,
+			"inconclusive_cells": count.inconclusive,
+			"untested_cells":     count.untested,
 		})
 	}
 
@@ -346,25 +420,30 @@ func (t *ToolSet) buildCoverageMatrix(topN int) (map[string]any, error) {
 	)
 
 	return map[string]any{
-		"summary":                summary,
-		"total_intents":          len(intents),
-		"assets_in_scope":        len(assets),
-		"assets_targeted":        len(targeted),
-		"coverage_pct":           pct,
-		"total_applicable_cells": totalApplicable,
-		"covered_cells":          coveredCells,
-		"in_flight_cells":        stateCounts[coverageStateInFlight],
-		"debt_cells":             stateCounts[coverageStateDebt],
-		"inconclusive_cells":     stateCounts[coverageStateInconclusive],
-		"untested_cells":         stateCounts[coverageStateUntested],
-		"category_coverage":      categoryStats,
-		"top_gaps":               topGaps,
-		"zero_targeted_assets":   zeroTargeted,
-		"zero_targeted_count":    zeroTargetedCount,
-		"global_categories":      sortedCoverageKeys(globalCats),
-		"unclassified_intents":   unclassified,
-		"intent_state_counts":    intentStateCounts,
-		"truncated":              intentsTruncated || factsTruncated || findingsTruncated || len(edges) >= 20000,
+		"summary":                        summary,
+		"total_intents":                  len(intents),
+		"assets_in_scope":                len(assets),
+		"assets_targeted":                len(targeted),
+		"coverage_pct":                   pct,
+		"total_applicable_cells":         totalApplicable,
+		"assets_with_covered_cells":      coveredAssets,
+		"assets_with_in_flight_cells":    inFlightAssets,
+		"assets_with_debt_cells":         debtAssets,
+		"assets_with_inconclusive_cells": inconclusiveAssets,
+		"assets_with_untested_cells":     untestedAssets,
+		"covered_cells":                  coveredCells,
+		"in_flight_cells":                stateCounts[coverageStateInFlight],
+		"debt_cells":                     stateCounts[coverageStateDebt],
+		"inconclusive_cells":             stateCounts[coverageStateInconclusive],
+		"untested_cells":                 stateCounts[coverageStateUntested],
+		"category_coverage":              categoryStats,
+		"top_gaps":                       topGaps,
+		"zero_targeted_assets":           zeroTargeted,
+		"zero_targeted_count":            zeroTargetedCount,
+		"global_categories":              sortedCoverageKeys(globalCats),
+		"unclassified_intents":           unclassified,
+		"intent_state_counts":            intentStateCounts,
+		"truncated":                      intentsTruncated || factsTruncated || findingsTruncated || len(edges) >= 20000,
 	}, nil
 }
 
@@ -401,12 +480,23 @@ func (t *ToolSet) coverageListNodes(kind string, cap int) ([]*db.Node, bool, err
 
 func coverageIntentEvidence(intentID int64, yields map[int64][]int64, facts, findings map[int64]*db.Node) (hasEvidence, observed, finding bool) {
 	for _, id := range yields[intentID] {
-		if _, ok := findings[id]; ok {
-			finding = true
-			hasEvidence = true
+		if n, ok := findings[id]; ok {
+			// A dismissed finding is a rejected hypothesis, not coverage. Ignore it
+			// here so it cannot close a cell; a done intent with only dismissed
+			// children remains inconclusive rather than covered.
+			if n.State == "confirmed" {
+				finding = true
+				hasEvidence = true
+			}
 			continue
 		}
 		if f, ok := facts[id]; ok {
+			// Match observedFactPredicate in db/task_assets_context.go: only a
+			// confirmed fact can be evidence. Origin is task setup, dismissed is
+			// rejected, and inferred facts are handled by coverageFactObserved.
+			if f.State != "confirmed" {
+				continue
+			}
 			hasEvidence = true
 			if coverageFactObserved(f) {
 				observed = true
@@ -441,6 +531,13 @@ func coverageFactObserved(n *db.Node) bool {
 	return strings.TrimSpace(evidence) != ""
 }
 
+// coverageIntentTargets reports whether an intent should mark its payload
+// assets as targeted. Stopped/deleted work is deliberately excluded; exhausted
+// and blocked still count because they represent debt the planner should see.
+func coverageIntentTargets(state string) bool {
+	return state != "stopped" && state != "deleted"
+}
+
 func coverageIntentState(state string, hasEvidence, observed, finding bool) (string, int, bool) {
 	switch state {
 	case "open", "paused":
@@ -470,17 +567,48 @@ func mergeCoverageCell(byCat map[string]coverageCell, cat string, incoming cover
 		return
 	}
 	if incoming.priority > current.priority {
-		incoming.inFlight = incoming.inFlight || current.inFlight
-		incoming.positive = incoming.positive || current.positive
 		byCat[cat] = incoming
 		return
 	}
-	if incoming.priority == current.priority {
-		current.intentIDs = append(current.intentIDs, incoming.intentIDs...)
-	}
-	current.inFlight = current.inFlight || incoming.inFlight
-	current.positive = current.positive || incoming.positive
 	byCat[cat] = current
+}
+
+// coverageIntentCategories reads the structured categories added by add_intent.
+// Unknown/empty values are ignored here (legacy or externally-created rows may
+// carry stale values); add_intent validates new writes. If no valid category is
+// present, the caller falls back to the legacy keyword classifier.
+func coverageIntentCategories(p map[string]any) []string {
+	raw, ok := p["categories"]
+	if !ok || raw == nil {
+		return nil
+	}
+	valid := make(map[string]bool, len(attackCategories))
+	for _, cat := range attackCategories {
+		valid[cat.Key] = true
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(attackCategories))
+	add := func(v any) {
+		key := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+		if key == "" || seen[key] || !valid[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	switch v := raw.(type) {
+	case []any:
+		for _, item := range v {
+			add(item)
+		}
+	case []string:
+		for _, item := range v {
+			add(item)
+		}
+	case string:
+		add(v)
+	}
+	return out
 }
 
 func coveragePayloadAssetIDs(p map[string]any) []int64 {
@@ -573,7 +701,10 @@ func coverageCategoryApplies(a *db.Asset, cat string) bool {
 		if a.Type == "app" || (a.Type == "service" && web) {
 			return true
 		}
-		return a.Type == "endpoint" && (coverageEndpointHasInput(a) || strings.EqualFold(a.Method, "GET"))
+		// A bare GET endpoint (health check, static JSON, robots.txt) is not an
+		// XSS surface. Require actual input or a login-like path; otherwise every
+		// static GET inflates the denominator by one cell.
+		return a.Type == "endpoint" && (coverageEndpointHasInput(a) || coverageEndpointLooksLikeLogin(a))
 	case "ssrf":
 		if a.Type == "app" || (a.Type == "service" && web) {
 			return true
@@ -589,7 +720,10 @@ func coverageCategoryApplies(a *db.Asset, cat string) bool {
 	case "config":
 		return web || a.Type == "service" || a.Type == "app" || a.Type == "endpoint"
 	case "infra":
-		return a.Type == "ip" || a.Type == "service" || a.Type == "app" || a.Type == "endpoint"
+		// Supply-chain/infrastructure applies to hosts, services and apps, not to
+		// every individual HTTP endpoint. Counting each endpoint as an infra cell
+		// made the denominator explode without adding a distinct test target.
+		return a.Type == "ip" || a.Type == "service" || a.Type == "app"
 	default:
 		return false
 	}
@@ -663,10 +797,17 @@ func coverageEndpointHasInput(a *db.Asset) bool {
 	if len(a.Params) > 0 {
 		return true
 	}
-	if a.Method != "" && !strings.EqualFold(a.Method, "GET") {
+	switch strings.ToUpper(strings.TrimSpace(a.Method)) {
+	case "POST", "PUT", "PATCH", "DELETE":
 		return true
+	case "", "GET", "HEAD", "OPTIONS", "TRACE":
+		// These methods have no request body. A login-like GET still counts
+		// because it accepts credentials in the URL/query; a bare health check
+		// does not.
+		return coverageEndpointLooksLikeLogin(a)
+	default:
+		return false
 	}
-	return coverageEndpointLooksLikeLogin(a)
 }
 
 func coverageEndpointLooksLikeLogin(a *db.Asset) bool {

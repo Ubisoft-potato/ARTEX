@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -52,6 +53,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
 		}
+		if cats, ok := p["categories"]; ok && cats != nil {
+			m["categories"] = cats
+		}
 		// asset_ids is the structured "which assets this direction covers" signal for
 		// dedup; fall back to legacy payload keys (target_ids plural, then target_id
 		// single) so intents stored before the rename still surface their anchors.
@@ -88,6 +92,12 @@ type ToolSet struct {
 	// auto-scope hook (insertAssets) is skipped, and add_task_scope/list_untested_assets
 	// are filtered out of the agent's tool list. The scope field stays regardless.
 	coverageDisabled bool
+	// coverageCache is a per-ToolSet (i.e. one planner round) memo of the matrix.
+	// Planner can call coverage_matrix more than once (often with different
+	// top_n); one full snapshot is computed and top_gaps is sliced per call. It is
+	// deliberately not shared across rounds, where worker writes must be visible.
+	coverageMu    sync.Mutex
+	coverageCache map[int]map[string]any
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
@@ -1245,12 +1255,13 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
-	DependsOn []json.RawMessage `json:"depends_on"` // intent node ids that must be done before this enters frontier
-	Mode      string            `json:"mode"`       // "probe"=快速验证可行性(限额 turns) | "exploit"=深度利用(默认)
+	Summary    string            `json:"summary"`
+	Categories []string          `json:"categories"` // structured coverage categories (optional; legacy intents use keyword fallback)
+	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	ParentIDs  []json.RawMessage `json:"parent_ids"`
+	Priority   int               `json:"priority"`
+	DependsOn  []json.RawMessage `json:"depends_on"` // intent node ids that must be done before this enters frontier
+	Mode       string            `json:"mode"`       // "probe"=快速验证可行性(限额 turns) | "exploit"=深度利用(默认)
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1260,6 +1271,10 @@ type intentItem struct {
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
+	}
+	cats, err := normalizeCoverageCategories(it.Categories)
+	if err != nil {
+		return 0, err
 	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
@@ -1282,6 +1297,9 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		mode = "exploit" // default; normalise so Frontier/Worker always see a clean value
 	}
 	payload := map[string]any{"summary": it.Summary, "mode": mode}
+	if len(cats) > 0 {
+		payload["categories"] = cats
+	}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
@@ -1324,8 +1342,9 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/categories/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"categories": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": attackCategoryKeys()}, "description": "可选：本方向对应的攻击类别（可多选），用于覆盖矩阵精确归类。不填则回退到 summary 关键词匹配；填了就不要漏掉真实类别。可用值：recon/auth/authz/injection/xss/ssrf/file/logic/config/infra。"},
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
@@ -2320,6 +2339,41 @@ var attackCategories = []struct {
 	}},
 }
 
+func attackCategoryKeys() []string {
+	out := make([]string, 0, len(attackCategories))
+	for _, cat := range attackCategories {
+		out = append(out, cat.Key)
+	}
+	return out
+}
+
+// normalizeCoverageCategories validates the optional structured categories on
+// add_intent. Unknown keys are rejected instead of silently dropped so a typo
+// cannot make an intent look covered under the wrong category.
+func normalizeCoverageCategories(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	valid := make(map[string]bool, len(attackCategories))
+	for _, cat := range attackCategories {
+		valid[cat.Key] = true
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		key := strings.ToLower(strings.TrimSpace(raw))
+		if key == "" || seen[key] {
+			continue
+		}
+		if !valid[key] {
+			return nil, fmt.Errorf("未知攻击类别 %q，可用类别: %v", raw, attackCategoryKeys())
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out, nil
+}
+
 // classifyCategories returns the attack category keys that match the given
 // intent summary (case-insensitive keyword scan). Returns nil if none match
 // (no explicit category signal — treated as "other" in the matrix).
@@ -2338,7 +2392,8 @@ func classifyCategories(summary string) []string {
 }
 
 // coverageMatrix builds an evidence-aware attack-surface coverage matrix for the
-// current task. It classifies intents with the legacy keyword taxonomy, but only
+// current task. It uses structured categories when add_intent supplied them and
+// falls back to the legacy keyword taxonomy for older rows. Only confirmed
 // observed facts/findings close a cell; open/running work is in-flight and
 // exhausted/blocked work is debt. Categories are filtered by asset applicability,
 // and the denominator is every in-scope asset, not just assets with an intent.

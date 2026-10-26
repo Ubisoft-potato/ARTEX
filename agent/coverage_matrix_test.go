@@ -58,6 +58,21 @@ func TestCoverageCategoryApplicability(t *testing.T) {
 	if coverageCategoryApplies(health, "authz") {
 		t.Fatal("static GET endpoint without input should not be applicable to authz")
 	}
+	if coverageCategoryApplies(health, "xss") {
+		t.Fatal("static GET endpoint without input should not be applicable to XSS")
+	}
+	if coverageCategoryApplies(health, "infra") {
+		t.Fatal("individual endpoints should not be reported as infra/supply-chain cells")
+	}
+	for _, method := range []string{"HEAD", "OPTIONS"} {
+		ep := &db.Asset{Type: "endpoint", URL: "https://example.test/status", Method: method}
+		if coverageEndpointHasInput(ep) {
+			t.Fatalf("%s without params must not count as input", method)
+		}
+		if coverageCategoryApplies(ep, "authz") {
+			t.Fatalf("%s without params must not be applicable to authz", method)
+		}
+	}
 
 	search := &db.Asset{
 		Type:   "endpoint",
@@ -100,6 +115,82 @@ func TestCoverageIntentState(t *testing.T) {
 				t.Fatalf("state=%q positive=%v, want state=%q positive=%v", state, positive, tt.wantState, tt.wantPositive)
 			}
 		})
+	}
+}
+
+func TestCoverageIntentEvidenceRequiresConfirmedNodes(t *testing.T) {
+	payload := func(confidence, evidence string) json.RawMessage {
+		raw, err := json.Marshal(map[string]any{"confidence": confidence, "evidence": evidence})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	facts := map[int64]*db.Node{
+		1: {ID: 1, Kind: db.KindFact, State: "confirmed", Payload: payload("observed", "saw it")},
+		2: {ID: 2, Kind: db.KindFact, State: "dismissed", Payload: payload("observed", "saw it")},
+		3: {ID: 3, Kind: db.KindFact, State: "confirmed", Payload: payload("inferred", "looks like it")},
+	}
+	findings := map[int64]*db.Node{
+		4: {ID: 4, Kind: db.KindFinding, State: "confirmed"},
+		5: {ID: 5, Kind: db.KindFinding, State: "dismissed"},
+	}
+	yields := map[int64][]int64{10: {1, 2, 3, 4, 5}}
+
+	has, observed, finding := coverageIntentEvidence(10, yields, facts, findings)
+	if !has || !observed || !finding {
+		t.Fatalf("confirmed evidence: has=%v observed=%v finding=%v, want true/true/true", has, observed, finding)
+	}
+
+	// Dismissed children are not evidence at all.
+	has, observed, finding = coverageIntentEvidence(10, map[int64][]int64{10: {2, 5}}, facts, findings)
+	if has || observed || finding {
+		t.Fatalf("dismissed evidence: has=%v observed=%v finding=%v, want all false", has, observed, finding)
+	}
+	// An inferred fact is evidence for "tried", but not observed coverage.
+	has, observed, finding = coverageIntentEvidence(10, map[int64][]int64{10: {3}}, facts, findings)
+	if !has || observed || finding {
+		t.Fatalf("inferred evidence: has=%v observed=%v finding=%v, want true/false/false", has, observed, finding)
+	}
+}
+
+func TestCoverageIntentTargetsExcludesStoppedAndDeleted(t *testing.T) {
+	for _, state := range []string{"stopped", "deleted"} {
+		if coverageIntentTargets(state) {
+			t.Fatalf("state %q must not mark assets as targeted", state)
+		}
+	}
+	for _, state := range []string{"open", "running", "done", "exhausted", "blocked", "paused"} {
+		if !coverageIntentTargets(state) {
+			t.Fatalf("state %q should mark assets as targeted", state)
+		}
+	}
+}
+
+func TestCoverageIntentCategoriesUsesStructuredField(t *testing.T) {
+	p := map[string]any{"categories": []any{"authz", "LOGIC", "bogus", "authz", ""}}
+	got := coverageIntentCategories(p)
+	if fmt.Sprint(got) != "[authz logic]" {
+		t.Fatalf("categories=%v, want [authz logic]", got)
+	}
+	if _, err := normalizeCoverageCategories([]string{"authz", "typo"}); err == nil {
+		t.Fatal("unknown category must be rejected on write")
+	}
+}
+
+func TestCoverageMatrixForTopNSlicesWithoutMutatingBase(t *testing.T) {
+	base := map[string]any{
+		"top_gaps": []coverageGap{{AssetID: 1}, {AssetID: 2}, {AssetID: 3}},
+		"summary":  "x",
+	}
+	out := coverageMatrixForTopN(base, 2)
+	gaps, _ := out["top_gaps"].([]coverageGap)
+	if len(gaps) != 2 || gaps[1].AssetID != 2 {
+		t.Fatalf("top_n slice = %+v, want first two gaps", gaps)
+	}
+	baseGaps, _ := base["top_gaps"].([]coverageGap)
+	if len(baseGaps) != 3 {
+		t.Fatalf("base cache mutated: %+v", baseGaps)
 	}
 }
 

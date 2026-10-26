@@ -305,22 +305,13 @@ target AS (
   SELECT DISTINCT a.id, a.type,
          COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
   FROM assets a
-  JOIN task_scope ts ON ts.task_id = $1 AND (
-       (ts.kind='company'     AND a.company_id = ts.company_id)
-    OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
-    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
-    OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
-  )
+  JOIN task_scope ts ON ts.task_id = $1 AND ` + taskScopeMatch + `
 ),
 tested AS (
   SELECT DISTINCT ea.asset_id
   FROM exploration_anchors ea
   JOIN exploration_nodes en ON en.id = ea.node_id
-  WHERE en.exploration_id = $2 AND en.kind = 'fact'
+  WHERE en.exploration_id = $2 AND ` + observedFactPredicate + `
 )`
 
 // TaskCoverage computes rough per-type coverage for a task. taskID indexes
@@ -418,8 +409,9 @@ func hostPortOf(n *CoverageGraphNode) (string, int) {
 
 // BuildCoverageGraph assembles the full coverage graph for a task and its direct
 // read-only sources: every in-scope asset plus connector root domains/companies,
-// with current-or-source fact anchors reflected in Tested. The legacy expID
-// argument is retained for API compatibility; the task registry is authoritative.
+// with current-or-source confirmed observed fact anchors reflected in Tested.
+// The legacy expID argument is retained for API compatibility; the task registry
+// is authoritative.
 func (s *AssetStore) BuildCoverageGraph(taskID, _ int64) (*CoverageGraphData, error) {
 	g := &CoverageGraphData{Nodes: []CoverageGraphNode{}, Edges: []CoverageGraphEdge{}}
 	if taskID <= 0 {

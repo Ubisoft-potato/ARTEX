@@ -21,21 +21,42 @@ context_tasks AS (
   WHERE relation.task_id=$1
 )`
 
+// taskScopeMatch is the single definition of "the asset belongs to a scope
+// row". Both the coverage read model and list_assets must use it: an ip/cidr
+// scope matches an asset's ip column AND an IP-literal host stored in domain
+// (services/endpoints often have domain="192.0.2.5" and ip empty). Keeping the
+// predicate in one place prevents the two read paths from drifting.
+const taskScopeMatch = `(
+       (ts.kind='company'     AND a.company_id = ts.company_id)
+    OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
+    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
+    OR (ts.kind IN ('ip','cidr') AND (ts.net >>= try_inet(a.ip) OR ts.net >>= try_inet(a.domain)))
+    OR (ts.kind='icp' AND (
+         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
+         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
+       ))
+)`
+
+// observedFactPredicate matches coverageFactObserved in the agent package:
+// dismissed facts never count, inferred facts never count, and an otherwise
+// unlabelled fact needs non-empty evidence. Shared by TaskCoverageWithSources
+// and ListUntestedAssetsWithSources so their backlog agrees with coverage_matrix.
+const observedFactPredicate = `en.kind='fact'
+   AND en.state='confirmed'
+   AND (
+        lower(btrim(COALESCE(en.payload->>'confidence','')))='observed'
+     OR (
+        lower(btrim(COALESCE(en.payload->>'confidence','')))<>'inferred'
+        AND btrim(COALESCE(en.payload->>'evidence',''))<>''
+     )
+   )`
+
 const contextCoverageCTE = directTaskContextCTE + `,
 target AS (
   SELECT DISTINCT a.id, a.type,
          COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
   FROM assets a
-  JOIN task_scope ts ON (
-       (ts.kind='company'     AND a.company_id = ts.company_id)
-    OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
-    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
-    OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
-  )
+  JOIN task_scope ts ON ` + taskScopeMatch + `
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
 	UNION
 	SELECT a.id, a.type,
@@ -48,8 +69,9 @@ target AS (
 tested AS (
   SELECT DISTINCT ea.asset_id
   FROM exploration_anchors ea
-  JOIN exploration_nodes en ON en.id=ea.node_id AND en.kind='fact'
+  JOIN exploration_nodes en ON en.id=ea.node_id
   JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
+  WHERE ` + observedFactPredicate + `
 )`
 
 // scopeTargetCTE selects every asset that BELONGS to the current task's (and its
@@ -75,16 +97,7 @@ context_tasks AS (
 target AS (
   SELECT DISTINCT a.id
   FROM assets a
-  JOIN task_scope ts ON (
-       (ts.kind='company'     AND a.company_id = ts.company_id)
-    OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
-    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND (ts.net >>= try_inet(a.ip) OR ts.net >>= try_inet(a.domain)))
-    OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
-  )
+  JOIN task_scope ts ON ` + taskScopeMatch + `
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
 )`
 
@@ -119,7 +132,8 @@ ORDER BY CASE WHEN ts.task_id=$1 THEN 0 ELSE 1 END, ts.id`, taskID)
 
 // TaskCoverageWithSources computes one coverage view over the union of the
 // current task and its direct sources: source scopes and anchored assets extend
-// the denominator, while fact anchors count as tested. No row is copied.
+// the denominator, while confirmed observed fact anchors count as tested
+// (dismissed and inferred facts do not). No row is copied.
 func (s *AssetStore) TaskCoverageWithSources(taskID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`WITH `+directTaskContextCTE+`
@@ -171,7 +185,8 @@ ORDER BY last_seen DESC, id DESC`, taskID)
 }
 
 // ListUntestedAssetsWithSources is the direct-source-aware backlog query used
-// by inherited tasks. Source fact anchors remove assets from the backlog.
+// by inherited tasks. Confirmed observed fact anchors remove assets from the
+// backlog; dismissed/inferred facts do not.
 func (s *AssetStore) ListUntestedAssetsWithSources(taskID int64, typ string, limit, offset int) ([]CoverageAsset, int, error) {
 	if limit <= 0 {
 		limit = 10
@@ -231,16 +246,7 @@ context_assets AS (
   UNION
   SELECT DISTINCT a.id
   FROM assets a
-  JOIN task_scope ts ON (
-       (ts.kind='company'     AND a.company_id=ts.company_id)
-    OR (ts.kind='root_domain' AND a.root_domain=ts.domain)
-    OR (ts.kind='subdomain'   AND a.domain=ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
-    OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
-  )
+  JOIN task_scope ts ON `+taskScopeMatch+`
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
 )
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,'')
