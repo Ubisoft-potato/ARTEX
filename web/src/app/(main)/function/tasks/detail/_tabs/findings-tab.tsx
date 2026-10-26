@@ -28,6 +28,16 @@ function findingLabel(finding: Finding): string {
   return "未分类";
 }
 
+function findingDetailHref(finding: Finding, contextTaskId: string): string {
+  const params = new URLSearchParams({ id: finding.finding_id ?? finding.id });
+  // Preserve the task findings tab for the detail page's back link. context_task
+  // is still only needed for inherited (read-only) findings.
+  params.set("from_task", contextTaskId);
+  params.set("from_tab", "findings");
+  if (finding.inherited) params.set("context_task", contextTaskId);
+  return `/function/findings/detail?${params.toString()}`;
+}
+
 const FINDING_STATUSES: FindingStatus[] = [
   "pending",
   "in_progress",
@@ -112,11 +122,7 @@ function Row({
         </span>
         {f.finding_id && (
           <Link
-            href={
-              f.inherited
-                ? `/function/findings/detail?id=${f.finding_id}&context_task=${contextTaskId}`
-                : `/function/findings/detail?id=${f.finding_id}`
-            }
+            href={findingDetailHref(f, contextTaskId)}
             className="text-muted-foreground hover:text-primary inline-flex shrink-0 items-center gap-0.5 text-xs"
             title="查看漏洞详情"
           >

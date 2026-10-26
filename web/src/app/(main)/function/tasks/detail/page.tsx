@@ -63,6 +63,12 @@ const TABS = [
   { value: "report", label: "报告" },
 ];
 
+const TASK_TAB_VALUES = new Set(TABS.map((tab) => tab.value));
+
+function taskTabFromParam(value: string | null): string {
+  return value && TASK_TAB_VALUES.has(value) ? value : "sessions";
+}
+
 function taskProfileIDs(task: Task): string[] {
   if (task.llm_profile_ids && task.llm_profile_ids.length > 0) {
     return task.llm_profile_ids.map(String);
@@ -206,10 +212,11 @@ function TaskDetailInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
+  const tabParam = searchParams.get("tab");
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState("sessions");
+  const [tab, setTab] = React.useState(() => taskTabFromParam(tabParam));
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -220,6 +227,22 @@ function TaskDetailInner() {
       .then(setProfiles)
       .catch(() => setProfiles([]));
   }, []);
+
+  // Keep the tab in the URL so browser back / a detail-page back link can return
+  // to the same task tab (e.g. ?tab=findings) instead of defaulting to sessions.
+  React.useEffect(() => {
+    setTab(taskTabFromParam(tabParam));
+  }, [tabParam]);
+
+  const changeTab = React.useCallback(
+    (next: string) => {
+      setTab(next);
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("tab", next);
+      router.replace(`/function/tasks/detail?${params.toString()}`, { scroll: false });
+    },
+    [router, searchParams],
+  );
 
   React.useEffect(() => {
     let alive = true;
@@ -348,7 +371,7 @@ function TaskDetailInner() {
   );
 
   return (
-    <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
+    <Tabs value={tab} onValueChange={changeTab} className="flex flex-1 flex-col gap-0">
       {/* Top fixed area */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">
