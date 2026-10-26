@@ -932,20 +932,20 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if !plannerRetryAllowed(failures) {
 				if !retrySuspended {
 					retrySuspended = true
-					log.Printf("[planner] task %s %s（连续第 %d 次失败），已停止快速重试，退回心跳/新事件: %v", t.ID, what, failures, err)
+					log.Printf("[planner] task %s %s（连续第 %d 次失败），已停止快速重试，退回心跳/新事件: %s", t.ID, what, failures, agent.ClipErrorText(err.Error()))
 					e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true,
 						Summary: fmt.Sprintf("%s（连续第 %d 次失败），已停止快速重试，退回心跳/新事件；请检查模型或网络后手动恢复", what, failures),
-						Detail:  err.Error()})
+						Detail:  agent.ClipErrorText(err.Error())})
 				} else {
-					log.Printf("[planner] task %s %s（连续第 %d 次失败，快速重试仍暂停）: %v", t.ID, what, failures, err)
+					log.Printf("[planner] task %s %s（连续第 %d 次失败，快速重试仍暂停）: %s", t.ID, what, failures, agent.ClipErrorText(err.Error()))
 				}
 				resetPlannerTimer(retry, time.Hour)
 			} else {
-				delay := plannerRetryDelay(failures)
-				log.Printf("[planner] task %s %s（连续第 %d 次，%s 后重试）: %v", t.ID, what, failures, delay, err)
+				delay := jitterRetryDelay(plannerRetryDelay(failures))
+				log.Printf("[planner] task %s %s（连续第 %d 次，%s 后重试）: %s", t.ID, what, failures, delay, agent.ClipErrorText(err.Error()))
 				e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true,
 					Summary: fmt.Sprintf("%s（连续第 %d 次），%s 后重试", what, failures, delay),
-					Detail:  err.Error()})
+					Detail:  agent.ClipErrorText(err.Error())})
 				resetPlannerTimer(retry, delay)
 			}
 		case met:
@@ -1112,9 +1112,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		delay := jitterRetryDelay(retryBackoff)
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
-		if sleepCtx(workCtx, retryBackoff) {
+			name, t.ID, intent.ID, delay, attempt, maxRetries)
+		if sleepCtx(workCtx, delay) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		e.BeginLLMCall(t.ID)
@@ -1209,7 +1210,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		return true
 	}
 	if err != nil {
-		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
+		log.Printf("[worker %s] intent %d: %s", name, intent.ID, agent.ClipErrorText(err.Error()))
 	}
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。

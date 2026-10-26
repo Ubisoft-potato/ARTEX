@@ -462,6 +462,25 @@ func clipBody(s string) string {
 	return s
 }
 
+// maxErrorTextBytes bounds provider errors before they reach server_logs,
+// activity.detail or the UI. Cloudflare 530 responses contain a full HTML page;
+// persisting thousands of those rows makes logs unreadable and bloats the DB.
+const maxErrorTextBytes = 4 << 10
+
+// ClipErrorText keeps the useful head of an error and explicitly marks the
+// truncation. It is safe for UTF-8 and is intentionally exported because the
+// server package writes the same provider errors into its own log/activity rows.
+func ClipErrorText(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(空错误)"
+	}
+	if len(s) <= maxErrorTextBytes {
+		return s
+	}
+	return safePrefixBytes(s, maxErrorTextBytes) + fmt.Sprintf("…(截断,共 %d 字节)", len(s))
+}
+
 // TestConnection makes a minimal real completion to verify the provider/model/
 // endpoint/key actually work. Returns the round-trip latency and the model's
 // reply text.

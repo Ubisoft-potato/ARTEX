@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math/rand"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -15,6 +16,27 @@ import (
 // 全局策略读一次 DB 一行 settings，调用点都在低频路径（构建 provider、work 收尾、
 // 保存配置），不值得再加一层缓存；熔断参数是例外——它在失败路径上每次都要读，所以
 // 由 applyRetryPolicy 推给 Registry 保存。
+
+// jitterRetryDelay spreads retry timers by ±20%. Planner/worker retries and
+// pre-commit stream retries traditionally used deterministic delays, so a burst
+// of Cloudflare 530/524 responses made every worker wake up at the same instant
+// and hit the tunnel again together. Jitter keeps the retry budget unchanged
+// while breaking that synchronization.
+func jitterRetryDelay(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	spread := d / 5 // 20%
+	if spread <= 0 {
+		return d
+	}
+	delta := time.Duration(rand.Int63n(int64(2*spread)+1)) - spread
+	out := d + delta
+	if out < 0 {
+		return 0
+	}
+	return out
+}
 
 // retryPolicy reads the global policy; a nil DB yields the zero policy (all
 // layers on their built-in defaults).

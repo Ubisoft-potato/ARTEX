@@ -327,9 +327,9 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				}
 				if streamErr != nil && !committed && ctx.Err() == nil &&
 					attempt < retries && isRetryableStreamError(streamErr) {
-					backoff := backoffOf(attempt)
-					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %v",
-						taskID, backoff, attempt+1, retries, streamErr)
+					backoff := jitterRetryDelay(backoffOf(attempt))
+					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %s",
+						taskID, backoff, attempt+1, retries, agent.ClipErrorText(streamErr.Error()))
 					if sleepCtx(ctx, backoff) {
 						break // 退避期间 ctx 取消 → 停止重试
 					}

@@ -260,7 +260,7 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
 	e.EndLLMCall(t.ID)
 	if err != nil {
-		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, err)
+		log.Printf("[deadline] task %s 终局规划出错: %s", t.ID, agent.ClipErrorText(err.Error()))
 	} else if met {
 		log.Printf("[deadline] task %s 终局判定目标达成: %s", t.ID, reason)
 	}

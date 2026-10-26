@@ -23,11 +23,54 @@ const (
 	// whose output changes does not count; the 2026-10-22 incident repeated one
 	// TodoWrite 78 times with an unchanged acknowledgement.
 	maxIdenticalToolCalls = 4
+	// maxIdenticalPollCalls is the same ceiling for polling-oriented tools. A
+	// worker checking a service that is still down can legitimately produce the
+	// same tool input and result several times; cutting that at four would turn
+	// a normal health check into a false loop abort.
+	maxIdenticalPollCalls = 8
 	// loopCycleWindow/loopCycleRepeats catch alternating A/B/A/B (or A/B/C)
 	// loops that never become four consecutive identical calls.
 	loopCycleWindow  = 12
 	loopCycleRepeats = 3
 )
+
+// loopCallLimit returns the identical-call ceiling for one tool. Only tools
+// whose normal use is waiting/polling get the larger budget; planning or
+// mutation tools still fail fast.
+func loopCallLimit(name string) int {
+	switch name {
+	case "Bash", "sleep", "shell_read":
+		return maxIdenticalPollCalls
+	default:
+		return maxIdenticalToolCalls
+	}
+}
+
+// passivePollingTool marks tools that are commonly alternated while waiting
+// (sleep -> shell_read -> sleep ...). A two-step cycle made only of these is a
+// monitor waiting for a state change, not a degenerate reasoning loop. Bash is
+// deliberately not in this set: an A/B cycle of actual commands is still worth
+// interrupting.
+func passivePollingTool(name string) bool {
+	switch name {
+	case "sleep", "shell_read":
+		return true
+	default:
+		return false
+	}
+}
+
+func cycleIsPassivePolling(tail []toolCallSig) bool {
+	if len(tail) == 0 {
+		return false
+	}
+	for _, sig := range tail {
+		if !passivePollingTool(sig.name) {
+			return false
+		}
+	}
+	return true
+}
 
 // toolCallSig identifies one completed tool call. The result hash is important:
 // a worker legitimately retrying `curl` while a service starts produces the
@@ -98,11 +141,20 @@ func (g *toolLoopGuard) observeResult(name string, inputSig [sha256.Size]byte, r
 	if len(g.recent) > loopCycleWindow {
 		g.recent = g.recent[len(g.recent)-loopCycleWindow:]
 	}
-	if g.repeat >= maxIdenticalToolCalls {
+	if g.repeat >= loopCallLimit(sig.name) {
 		return true
 	}
+	// Consecutive identical calls are governed solely by loopCallLimit above.
+	// Without this early return, the shorter cycle detector would treat six
+	// identical Bash polls as three A/A "cycles" and trip before the poll
+	// budget of eight.
+	if g.repeat > 1 {
+		return false
+	}
 	// A/B/A/B/A/B (and A/B/C repeated three times) are loops too, even though
-	// no call is byte-identical to its immediate predecessor.
+	// no call is byte-identical to its immediate predecessor. Skip cycles that
+	// consist solely of passive polling tools: sleep/shell_read alternating is
+	// exactly what a monitor does while waiting for a target to recover.
 	for n := 2; n <= 4; n++ {
 		if len(g.recent) < n*loopCycleRepeats {
 			continue
@@ -115,7 +167,7 @@ func (g *toolLoopGuard) observeResult(name string, inputSig [sha256.Size]byte, r
 				break
 			}
 		}
-		if ok {
+		if ok && !cycleIsPassivePolling(tail) {
 			return true
 		}
 	}

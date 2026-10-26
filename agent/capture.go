@@ -167,7 +167,8 @@ stream:
 				rec(activityWithUsage(db.Activity{Kind: "result", Summary: firstLine(sum, 400), Detail: detail}, lastUsage))
 				return finalText, reason, ctx.Err()
 			}
-			rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: "执行出错: " + err.Error(), Detail: err.Error()}, lastUsage))
+			detail := ClipErrorText(err.Error())
+			rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: firstLine("执行出错: "+detail, 400), Detail: detail}, lastUsage))
 			return finalText, reason, err
 		}
 		switch ev.Kind {

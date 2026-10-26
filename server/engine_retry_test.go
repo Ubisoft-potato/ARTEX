@@ -5,6 +5,21 @@ import (
 	"time"
 )
 
+func TestJitterRetryDelayBounds(t *testing.T) {
+	for _, base := range []time.Duration{time.Second, 5 * time.Second, 2 * time.Minute} {
+		low, high := base-base/5, base+base/5
+		for i := 0; i < 100; i++ {
+			got := jitterRetryDelay(base)
+			if got < low || got > high {
+				t.Fatalf("jitterRetryDelay(%s)=%s, want [%s,%s]", base, got, low, high)
+			}
+		}
+	}
+	if got := jitterRetryDelay(0); got != 0 {
+		t.Fatalf("jitterRetryDelay(0)=%s, want 0", got)
+	}
+}
+
 func TestPlannerRetryDelay(t *testing.T) {
 	want := []time.Duration{
 		5 * time.Second,
