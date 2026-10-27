@@ -151,6 +151,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	// Last-resort memory valve over the whole service cgroup: reap idle or
+	// oversized process trees (MCP, agent-spawned python/Chromium, …) before
+	// the cgroup and then the host runs out of memory. See server/memguard.go.
+	go s.watchMemoryPressure()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()

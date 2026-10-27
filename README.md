@@ -243,6 +243,13 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
+**资源保护**：`ARTEX_GOMEMLIMIT=2GiB` 设置 Go 堆软上限（`0` 关闭，默认 2 GiB）；
+`ARTEX_MEMGUARD=off` 关闭内存看门狗（默认开启，覆盖**整个 artex cgroup**——不只是 MCP，
+Agent 通过 Bash/自定义工具拉起的 python、Chromium、扫描器等子进程树同样在范围内，只处理
+RSS ≥ `ARTEX_MEMGUARD_TREE_MB`（默认 200）的重进程树）。cgroup 用量到 75% 记日志、85%
+回收空闲 15 分钟以上的进程树、93% 先回收空闲 1 分钟以上的、持续超限则按体积回收最大的几棵；
+系统可用内存低于 1 GiB / 512 MiB 时同样触发。
+
 **常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
 
 ---

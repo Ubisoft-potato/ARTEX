@@ -83,7 +83,7 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
 				}
-				cl, err := connectMCP(ctx, m)
+				cl, err := connectMCPForRun(ctx, pg, m)
 				if err != nil {
 					log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
 					continue

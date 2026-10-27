@@ -8,7 +8,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/mcphttp"
-	"github.com/Autumn-27/norma/mcp"
+	"github.com/Autumn-27/artex/mcpstdio"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -27,7 +27,9 @@ func connectMCP(ctx context.Context, m *db.MCPServer) (mcpClient, error) {
 		if m.Command == "" {
 			return nil, fmt.Errorf("stdio 传输缺少命令")
 		}
-		return mcp.NewStdioClient(ctx, m.Name, m.Command, jsonStrMap(m.Env), jsonStrSlice(m.Args)...)
+		// mcpstdio (not the SDK client) so Close() kills the whole process group:
+		// npx → npm → node → Chromium. See the package doc for why.
+		return mcpstdio.NewStdioClient(ctx, m.Name, m.Command, jsonStrMap(m.Env), jsonStrSlice(m.Args)...)
 	case "http":
 		if m.URL == "" {
 			return nil, fmt.Errorf("http 传输缺少 URL")
@@ -58,7 +60,7 @@ func (s *Server) discoverAndCacheMCP(ctx context.Context, m *db.MCPServer) error
 	}
 	tools := make([]db.MCPTool, 0, len(ts))
 	for _, t := range ts {
-		tools = append(tools, db.MCPTool{Name: t.Name(), Description: t.Description()})
+		tools = append(tools, db.MCPTool{Name: t.Name(), Description: t.Description(), Schema: t.InputSchema()})
 	}
 	if err := s.m.pg.SaveMCPTools(m.ID, tools); err != nil {
 		return err
@@ -78,7 +80,10 @@ func (s *Server) discoverEmptyMCPsOnStartup() {
 		return
 	}
 	for _, m := range servers {
-		if !m.Enabled || len(m.Tools) > 0 {
+		if !m.Enabled {
+			continue
+		}
+		if len(m.Tools) > 0 && !s.mcpSchemasMissing(m.ID) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
@@ -87,4 +92,21 @@ func (s *Server) discoverEmptyMCPsOnStartup() {
 		}
 		cancel()
 	}
+}
+
+// mcpSchemasMissing reports whether the cached tool list predates schema
+// caching (older ARTEX stored name+description only). Those rows still work
+// with lazy start, but SearchExtraTools would show a schema-less tool, so we
+// refresh them once at startup.
+func (s *Server) mcpSchemasMissing(serverID int64) bool {
+	cached, err := s.m.pg.MCPToolsDetailed(serverID)
+	if err != nil || len(cached) == 0 {
+		return false
+	}
+	for _, t := range cached {
+		if len(t.Schema) == 0 {
+			return true
+		}
+	}
+	return false
 }

@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复的问题
+
+- **修复 MCP 子进程泄漏导致整机内存耗尽/卡死**：stdio MCP（如内置 Playwright 浏览器）现在运行在独立进程组中，关闭时 `SIGTERM → 宽限 → SIGKILL` 回收整棵进程树（`npx → npm → node → Chromium`），不再只杀最外层的 npx 包装进程；启动失败、运行结束、服务退出三种路径都会清理。
+- **MCP 服务改为按需启动**：工具列表命中缓存时不再为每个 planner/worker/mainagent 运行预启动一个 Playwright MCP + 浏览器，只有真正调用其工具时才拉起进程，运行结束即回收。多任务并发时的常驻内存从"每会话数百 MB"降为"仅实际使用浏览器的会话"。
+- **新增内存看门狗**：覆盖整个 artex cgroup（不只 MCP）——cgroup 用量达到 75%/85%/93% 或系统可用内存低于 1 GiB/512 MiB 时，分级回收空闲或超大的进程树（MCP、Agent 通过 Bash/自定义工具拉起的 python/Chromium/扫描器等）并强制 GC，避免再次出现交换分区拖死整机的情况；进程树按「PID + 内核 start tick」校验，杜绝误杀复用 PID，且永远不会触碰 artex 自身或共享 cgroup 里的其它会话进程。可用 `ARTEX_MEMGUARD=off` 关闭，`ARTEX_MEMGUARD_TREE_MB` 调整重进程树门槛（默认 200MB）。
+- **新增 Go 堆软上限**（默认 2 GiB，`ARTEX_GOMEMLIMIT` 可调），避免压缩/上下文膨胀时堆无界增长挤压系统内存。
+- 工具缓存现在会一并保存 MCP 工具的 input schema，供按需启动时直接暴露工具；老缓存会在下次启动时自动重新发现一次。
+
 ## [0.3.12] - 2026-09-17
 
 ### 探索链路播报板
