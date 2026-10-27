@@ -54,7 +54,16 @@ func connectMCPForRun(ctx context.Context, pg *db.DB, m *db.MCPServer) (mcpClien
 			}), nil
 		}
 	}
-	return connectMCP(ctx, m)
+	cl, err := connectMCP(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	// Eagerly connected stdio clients have no lazy proxy, so wrap their tools
+	// to keep the same pre-call admission check.
+	if m.Transport == "stdio" {
+		return admittedClient{mcpClient: cl, name: m.Name}, nil
+	}
+	return cl, nil
 }
 
 // Tools builds the tool surface from the cache. No subprocess is started.
@@ -75,6 +84,13 @@ func (l *lazyMCP) Tools(context.Context) ([]actool.CoreTool, error) {
 				return permission.AskUser("call MCP tool " + full + "?")
 			},
 			Run: func(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
+				// Admission before use: the first browser page operation spawns
+				// Chromium (~300–500 MB). Under pressure this reclaims idle
+				// trees and waits, then returns a retryable error instead of
+				// pushing the cgroup into its hard limit.
+				if err := admitToolCall(ctx, l.name, ct.Name); err != nil {
+					return actool.Errorf("Error: " + err.Error()), nil
+				}
 				t, err := l.resolve(ctx, full, ct.Name)
 				if err != nil {
 					return actool.Errorf("Error: " + err.Error()), nil

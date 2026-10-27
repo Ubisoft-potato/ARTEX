@@ -250,6 +250,11 @@ RSS ≥ `ARTEX_MEMGUARD_TREE_MB`（默认 200）的重进程树）。cgroup 用�
 回收空闲 15 分钟以上的进程树、93% 先回收空闲 1 分钟以上的、持续超限则按体积回收最大的几棵；
 系统可用内存低于 1 GiB / 512 MiB 时同样触发。
 
+另有一层**启动/使用前准入检查**（默认开启）：启动 stdio MCP 需要 256MB cgroup 余量，首次
+拉起浏览器（Chromium）需要 600MB；不足时先同步回收空闲进程并最多等待 30 秒，仍不足就返回
+可重试的工具错误，而不是硬启后把 cgroup 顶到硬限。`ARTEX_MEMGUARD_ADMIT=off` 可只关准入
+（`ARTEX_MEMGUARD=off` 两者都关）。
+
 **常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
 
 ---

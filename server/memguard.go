@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/mcpstdio"
@@ -60,7 +61,7 @@ func (s *Server) watchMemoryPressure() {
 		log.Printf("[memguard] 已启用: 无数值型 cgroup 限制，按系统可用内存判定")
 	}
 
-	guard := newMemGuard()
+	guard := globalMemGuard
 	var lastReport time.Time
 	var hardTicks int
 	for {
@@ -201,9 +202,14 @@ func splitMCPTrees(all []procTree) (mcp, generic []procTree) {
 // --- idle/CPU tracking ---
 
 type memGuard struct {
+	mu         sync.Mutex
 	lastCPU    map[string]uint64
 	lastActive map[string]time.Time
 }
+
+// globalMemGuard keeps CPU/idle history for both the background watchdog and
+// the synchronous admission checks (admit.go).
+var globalMemGuard = newMemGuard()
 
 func newMemGuard() *memGuard {
 	return &memGuard{lastCPU: map[string]uint64{}, lastActive: map[string]time.Time{}}
@@ -218,6 +224,8 @@ func treeKey(t procTree) string {
 // on the network for a long time counts as idle, which is what we want under
 // memory pressure).
 func (g *memGuard) observe(trees []procTree, now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	seen := make(map[string]bool, len(trees))
 	for _, t := range trees {
 		k := treeKey(t)
@@ -237,6 +245,12 @@ func (g *memGuard) observe(trees []procTree, now time.Time) {
 }
 
 func (g *memGuard) idle(t procTree, now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.idleLocked(t, now)
+}
+
+func (g *memGuard) idleLocked(t procTree, now time.Time) time.Duration {
 	if at, ok := g.lastActive[treeKey(t)]; ok {
 		return now.Sub(at)
 	}
@@ -245,12 +259,14 @@ func (g *memGuard) idle(t procTree, now time.Time) time.Duration {
 
 // pick returns heavy trees idle for at least idleFor, heaviest first.
 func (g *memGuard) pick(trees []procTree, minRSS int64, idleFor time.Duration, now time.Time) []procTree {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var out []procTree
 	for _, t := range trees {
 		if t.RSS < minRSS {
 			continue
 		}
-		if idleFor > 0 && g.idle(t, now) < idleFor {
+		if idleFor > 0 && g.idleLocked(t, now) < idleFor {
 			continue
 		}
 		out = append(out, t)

@@ -27,6 +27,12 @@ func connectMCP(ctx context.Context, m *db.MCPServer) (mcpClient, error) {
 		if m.Command == "" {
 			return nil, fmt.Errorf("stdio 传输缺少命令")
 		}
+		// Admission check before spawning a process: refuse (after a
+		// synchronous idle reclaim) when the cgroup is nearly full, instead
+		// of launching npx/node into a cgroup that is about to OOM.
+		if err := admitStdioSpawn(); err != nil {
+			return nil, err
+		}
 		// mcpstdio (not the SDK client) so Close() kills the whole process group:
 		// npx → npm → node → Chromium. See the package doc for why.
 		return mcpstdio.NewStdioClient(ctx, m.Name, m.Command, jsonStrMap(m.Env), jsonStrSlice(m.Args)...)
