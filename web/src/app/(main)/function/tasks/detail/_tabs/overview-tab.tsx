@@ -569,6 +569,77 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           )}
         </CardContent>
       </Card>
+      {/* LLM Token 用量：按模型分组，数据来自 llm_records（需开启 LLM 录制）。 */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <CoinsIcon className="size-4 text-amber-500" /> LLM Token 用量
+            <span className="text-muted-foreground text-xs font-normal">
+              （按模型统计{tokenTotals.calls > 0 ? `，共 ${tokenTotals.calls} 次调用` : ""}）
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {modelTokens.length > 0 ? (
+            <>
+              {/* 合计总览 */}
+              <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-sm">
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">输入 </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.input)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">输出 </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.output)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">缓存读 </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.cacheRead)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">缓存命中率 </span>
+                  <span className="font-semibold text-emerald-500">
+                    {cacheHitRate(tokenTotals.cacheRead, tokenTotals.input)}
+                  </span>
+                </span>
+              </div>
+              {/* 按模型明细表 */}
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-muted-foreground border-b text-left text-xs">
+                      <th className="py-1.5 pr-3 font-medium">模型</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">调用</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">输入</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">输出</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">缓存读</th>
+                      <th className="py-1.5 text-right font-medium">命中率</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modelTokens.map((m) => (
+                      <tr key={m.model} className="border-b last:border-0">
+                        <td className="max-w-[16rem] truncate py-1.5 pr-3 font-mono text-xs" title={m.model}>
+                          {m.model}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{m.calls}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
+                        <td className="py-1.5 text-right tabular-nums text-emerald-500">
+                          {cacheHitRate(m.cache_read_tokens, m.input_tokens)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <p className="text-muted-foreground text-sm">暂无 LLM 用量（任务尚未产生调用，或记录仍在写入）。</p>
+          )}
+        </CardContent>
+      </Card>
       {/* 操作约束管理：allow=允许 / deny=禁止。约束会在下一轮规划时注入 planner/worker 的系统
           提示以框定探索边界（注入范围可在 系统设置 里按 planner/worker 开关）。改动不即时打断，
           下一轮规划自然读到。 */}
@@ -730,77 +801,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </CardContent>
         </Card>
       )}
-      {/* LLM Token 用量：按模型分组，数据来自 llm_records（需开启 LLM 录制）。 */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <CoinsIcon className="size-4 text-amber-500" /> LLM Token 用量
-            <span className="text-muted-foreground text-xs font-normal">
-              （按模型统计{tokenTotals.calls > 0 ? `，共 ${tokenTotals.calls} 次调用` : ""}）
-            </span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {modelTokens.length > 0 ? (
-            <>
-              {/* 合计总览 */}
-              <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-sm">
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">输入 </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.input)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">输出 </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.output)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">缓存读 </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.cacheRead)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">缓存命中率 </span>
-                  <span className="font-semibold text-emerald-500">
-                    {cacheHitRate(tokenTotals.cacheRead, tokenTotals.input)}
-                  </span>
-                </span>
-              </div>
-              {/* 按模型明细表 */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-muted-foreground border-b text-left text-xs">
-                      <th className="py-1.5 pr-3 font-medium">模型</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">调用</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">输入</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">输出</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">缓存读</th>
-                      <th className="py-1.5 text-right font-medium">命中率</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {modelTokens.map((m) => (
-                      <tr key={m.model} className="border-b last:border-0">
-                        <td className="max-w-[16rem] truncate py-1.5 pr-3 font-mono text-xs" title={m.model}>
-                          {m.model}
-                        </td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{m.calls}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
-                        <td className="py-1.5 text-right tabular-nums text-emerald-500">
-                          {cacheHitRate(m.cache_read_tokens, m.input_tokens)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <p className="text-muted-foreground text-sm">暂无 LLM 用量（任务尚未产生调用，或记录仍在写入）。</p>
-          )}
-        </CardContent>
-      </Card>
       {/* 测试范围：覆盖度分母 + 授权边界，可手动增删。 */}
       <Card>
         <CardHeader>
