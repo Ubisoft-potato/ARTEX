@@ -223,7 +223,7 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 	}
 	// One-time: the historical default was 1200s. New semantics treat 0 as
 	// "no explicit budget" and let each role apply its own fallback ceiling
-	// (worker 2h / chat 1h / planner 8m, capped at 10m). Migrate system agents
+	// (worker 2h / chat 1h / planner 30m, capped at 30m). Migrate system agents
 	// still sitting on the old default; the settings flag keeps a later explicit
 	// 1200 (or any user choice) from being overwritten on restart.
 	if v, _, _ := d.GetSetting("agent_run_seconds_zero_v1"); v != "true" {

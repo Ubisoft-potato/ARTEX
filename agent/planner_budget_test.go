@@ -18,7 +18,7 @@ func TestPlannerRunBudget(t *testing.T) {
 	}
 	// A too-large run_seconds (or the old unlimited default) must never restore
 	// the multi-hour hang the 2026-10-22 incident exposed.
-	p.SetRunTimeout(30 * time.Minute)
+	p.SetRunTimeout(45 * time.Minute)
 	if got := p.runBudget(); got != plannerRunCeiling {
 		t.Fatalf("over-cap run budget=%s want %s", got, plannerRunCeiling)
 	}

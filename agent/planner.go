@@ -26,14 +26,15 @@ const runSettleGrace = 3 * time.Minute
 
 const (
 	// defaultPlannerRun is one planning round's wall-clock budget when run_seconds
-	// is unset. A round is a situational review plus a handful of write-backs; it
-	// should never need half an hour.
-	defaultPlannerRun = 8 * time.Minute
+	// is unset. A large graph and a slow reasoning model can legitimately need
+	// more than the old 8-minute window; 30 minutes leaves room for a full
+	// review without allowing a degenerate loop to hang indefinitely.
+	defaultPlannerRun = 30 * time.Minute
 	// plannerRunCeiling caps one round even when run_seconds is configured higher.
 	// The 2026-10-22 incident ran a single planner Plan() for ~2h because the
 	// planner had no wall-clock bound at all (MaxDuration was 0), repeatedly
 	// emitting the same TodoWrite turn. The ceiling makes that impossible.
-	plannerRunCeiling = 10 * time.Minute
+	plannerRunCeiling = 30 * time.Minute
 	// plannerTurnCeiling bounds tool-turns when max_turns=0 (unlimited). Normal
 	// rounds use a handful of turns; 40 is only a degenerate-loop backstop.
 	plannerTurnCeiling = 40
