@@ -104,10 +104,12 @@ func (p *Planner) SetNoaEnabled(fn func() bool) { p.noaEnabledFn = fn }
 func (p *Planner) SetMaxTokens(fn func() int) { p.maxTokensFn = fn }
 
 func (p *Planner) maxTokens() int {
-	if p.maxTokensFn == nil {
-		return 0
+	if p.maxTokensFn != nil {
+		if n := p.maxTokensFn(); n > 0 {
+			return n
+		}
 	}
-	return p.maxTokensFn()
+	return SafeMaxTokens(p.compactionWindow())
 }
 
 // SetRunTimeout configures the wall-clock budget for one planning round
@@ -554,7 +556,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		ToolOutputDir:         cmdOutDir(taskDir),
 		MaxTurns:              maxTurns, // 0=unlimited 已被 plannerTurnCeiling 兜底
 		MaxDuration:           soft,     // 软墙钟预算(任务 deadline 更紧时取剩余)
-		Compaction:            compactionConfig(p.compactionWindow()),
+		Compactor:             newBudgetCompactor(p.prov, p.compactionWindow(), p.maxTokens(), p.nonStreaming()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、

@@ -57,10 +57,12 @@ func (c *ChatAgent) SetNoaEnabled(fn func() bool) { c.noaEnabledFn = fn }
 func (c *ChatAgent) SetMaxTokens(fn func() int) { c.maxTokensFn = fn }
 
 func (c *ChatAgent) maxTokens() int {
-	if c.maxTokensFn == nil {
-		return 0
+	if c.maxTokensFn != nil {
+		if n := c.maxTokensFn(); n > 0 {
+			return n
+		}
 	}
-	return c.maxTokensFn()
+	return SafeMaxTokens(c.window)
 }
 
 // SetProxy points the chat agent's WebFetch/Bash at the recording proxy plus the
@@ -152,7 +154,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		WorkingDir:            sessionWorkDir,
 		MaxTurns:              maxTurns,
 		MaxDuration:           effectiveRun,
-		Compaction:            compactionConfig(c.window),
+		Compactor:             newBudgetCompactor(c.prov, c.window, c.maxTokens(), c.nonStreaming()),
 		Todos:                 actool.NewTodoStore(),
 		// large tool output spills to cmd-output/ under the session dir.
 		// 截断上限用 SDK 默认(tool.Capture 的 30000 字符)。

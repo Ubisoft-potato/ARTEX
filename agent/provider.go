@@ -22,7 +22,6 @@ import (
 
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/transcript"
@@ -125,14 +124,23 @@ func (c Config) CompactionWindow() int {
 	return k * 1000
 }
 
-// compactionConfig builds the agent-core compaction config for a context window
-// in tokens. agentcore.NewSession wires the summarizer (same provider) when this
-// is set on Options.Compaction.
-func compactionConfig(windowTokens int) *compaction.Config {
+// SafeMaxTokens returns a conservative per-reply output cap when the profile
+// leaves max_tokens unset (0). Many OpenAI-compatible gateways default to 32K
+// output; combining that with a ~230K prompt overflows a 262K model before
+// compaction can react. 16K is enough for tool calls/summaries and leaves
+// headroom for the prompt. Smaller windows get a proportionally smaller cap.
+func SafeMaxTokens(windowTokens int) int {
 	if windowTokens <= 0 {
 		windowTokens = defaultWindowK * 1000
 	}
-	return &compaction.Config{ContextWindow: windowTokens}
+	n := windowTokens / 8
+	if n > 16384 {
+		n = 16384
+	}
+	if n < 1024 {
+		n = 1024
+	}
+	return n
 }
 
 // FromEnv resolves the LLM provider config:

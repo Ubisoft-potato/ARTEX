@@ -423,6 +423,9 @@ func nonStreamingResolver(cfg agent.Config) func() bool {
 // maxTokensResolver mirrors nonStreamingResolver for the per-reply output cap.
 func maxTokensResolver(cfg agent.Config) func() int {
 	maxTokens := cfg.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = agent.SafeMaxTokens(cfg.CompactionWindow())
+	}
 	return func() int { return maxTokens }
 }
 

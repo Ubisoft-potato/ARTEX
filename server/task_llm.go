@@ -184,8 +184,16 @@ func (r *taskLLMRuntime) nonStreaming() bool {
 // maxTokens returns the currently-active source's per-reply output cap.
 // Unresolvable → 0, i.e. send no cap, matching the pre-setting behaviour.
 func (r *taskLLMRuntime) maxTokens() int {
-	cfg, _ := r.activeCfg() // 未解析出配置时是零值 0
-	return cfg.MaxTokens
+	cfg, ok := r.activeCfg()
+	if !ok {
+		return 0
+	}
+	if cfg.MaxTokens > 0 {
+		return cfg.MaxTokens
+	}
+	// Profile leaves max_tokens unset. Don't let the gateway's 32K default plus a
+	// near-limit prompt overflow the model window before compaction can run.
+	return agent.SafeMaxTokens(cfg.CompactionWindow())
 }
 
 func parseTaskID(id string) (int64, error) {
