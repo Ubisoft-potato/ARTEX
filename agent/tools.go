@@ -92,6 +92,9 @@ type ToolSet struct {
 	// auto-scope hook (insertAssets) is skipped, and add_task_scope/list_untested_assets
 	// are filtered out of the agent's tool list. The scope field stays regardless.
 	coverageDisabled bool
+	// overviewBudget bounds graph_overview output in bytes. The planner and worker
+	// set it from their actual model window; zero keeps the default tool budget.
+	overviewBudget int
 	// coverageCache is a per-ToolSet (i.e. one planner round) memo of the matrix.
 	// Planner can call coverage_matrix more than once (often with different
 	// top_n); one full snapshot is computed and top_gaps is sliced per call. It is
@@ -217,6 +220,13 @@ func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
 // either way, because task_scope is the task's range boundary (the filter basis for
 // asset queries), not merely a coverage denominator.
 func (t *ToolSet) SetCoverageEnabled(enabled bool) { t.coverageDisabled = !enabled }
+
+// SetOverviewBudget bounds graph_overview by the caller's actual context window.
+// The planner/worker also pre-inject the same snapshot, so a model that later
+// calls the tool must not receive a payload larger than the window can hold.
+func (t *ToolSet) SetOverviewBudget(windowTokens int) {
+	t.overviewBudget = graphOverviewBudgetForWindow(windowTokens)
+}
 
 // CoverageDisabled reports whether the coverage feature is off for this task.
 func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
@@ -432,6 +442,22 @@ func truncRunes(s string, n int) string {
 // the model needn't spend a turn calling the tool — every plan round starts with
 // an empty context and always needs this first).
 func (t *ToolSet) graphOverviewData() map[string]any {
+	budget := t.overviewBudget
+	if budget <= 0 {
+		budget = overviewToolBudgetBytes
+	}
+	return t.graphOverviewDataWithBudget(budget)
+}
+
+// graphOverviewDataForPrompt builds the same snapshot with a budget derived from
+// the caller's current model window. The planner/worker pre-inject this JSON into
+// their first user turn, so it must not grow with the graph: a large task can
+// otherwise spend most of the model window before the model has done anything.
+func (t *ToolSet) graphOverviewDataForPrompt(windowTokens int) map[string]any {
+	return t.graphOverviewDataWithBudget(graphOverviewBudgetForWindow(windowTokens))
+}
+
+func (t *ToolSet) graphOverviewDataWithBudget(maxBytes int) map[string]any {
 	out := map[string]any{}
 	// goals summary folded in so the planner needn't call list_goals each round.
 	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
@@ -760,7 +786,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			}
 		}
 	}
-	return out
+	return trimGraphOverview(out, maxBytes)
 }
 
 func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
