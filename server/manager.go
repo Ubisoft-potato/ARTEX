@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 // sharing the process-wide asset store. ID is the PG task id as a string; ExpID
 // is the exploration the task owns.
 type Task struct {
+	RunRevision  int64  `json:"-"`
 	ID           string `json:"id"`
 	ExpID        int64  `json:"exploration_id"`
 	Name         string `json:"name"` // 可选任务名称;空=未命名
@@ -78,6 +80,7 @@ type Task struct {
 // updateLifecycle instead of reading or writing the corresponding Task fields
 // directly after the task has been published by Manager.
 type taskLifecycleState struct {
+	RunRevision   int64
 	Name          string
 	PinnedAt      int64
 	Status        string
@@ -105,6 +108,7 @@ func (t *Task) lifecycleSnapshot() taskLifecycleState {
 
 func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 	return taskLifecycleState{
+		RunRevision:   t.RunRevision,
 		Name:          t.Name,
 		PinnedAt:      t.PinnedAt,
 		Status:        t.Status,
@@ -129,6 +133,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.lifecycleMu.Lock()
 	state := t.lifecycleSnapshotLocked()
 	update(&state)
+	t.RunRevision = state.RunRevision
 	t.Name = state.Name
 	t.PinnedAt = state.PinnedAt
 	t.Status = state.Status
@@ -216,6 +221,9 @@ type DeleteTaskResult struct {
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration
 // graph + config) and the in-memory set of task handles.
 type Manager struct {
+	closeOnce   sync.Once
+	closeErr    error
+	servers     []*Server
 	dir         string
 	pg          *pgdb.DB
 	assets      *pgdb.AssetStore
@@ -801,12 +809,32 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.traffic != nil {
-		m.traffic.Close()
-	}
-	return m.pg.Close()
+	m.closeOnce.Do(func() {
+		m.mu.RLock()
+		servers := append([]*Server(nil), m.servers...)
+		m.mu.RUnlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		for _, s := range servers {
+			if err := s.Shutdown(ctx); err != nil {
+				m.closeErr = err
+				return
+			}
+		}
+		if m.enrich != nil {
+			if err := m.enrich.CloseContext(ctx); err != nil {
+				m.closeErr = err
+				return
+			}
+		}
+		if m.traffic != nil {
+			m.closeErr = m.traffic.Close()
+		}
+		if m.pg != nil {
+			m.closeErr = errors.Join(m.closeErr, m.pg.Close())
+		}
+	})
+	return m.closeErr
 }
 
 // isTerminalStatus reports whether a task status is terminal (done/failed/timeout).
@@ -830,7 +858,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
 	return &Task{
-		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
+		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID, RunRevision: pt.RunRevision,
 		Name:       pt.Name,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
 		PinnedAt:    unixOrZero(pt.PinnedAt),
@@ -1163,6 +1191,7 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 
 	var queuedAt, completedAt, firstRunAt, deadlineAt sql.NullTime
 	var committedMode string
+	var runRevision int64
 	err = m.pg.QueryRow(`UPDATE tasks
 	SET status=$2,
 	    completed_at=CASE
@@ -1190,8 +1219,8 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	        ELSE deadline_at
 	    END
 	WHERE id=$1 AND deleted_at IS NULL AND status=$6
-	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
-		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
+	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at,run_revision`, n, status, queued, mode, preservePosition, expectedStatus).
+		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt, &runRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
 	}
@@ -1202,6 +1231,7 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
+			state.RunRevision = runRevision
 			state.Status = status
 			state.Paused = false
 			state.Queued = queued
@@ -1418,6 +1448,9 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
+			if isTerminalStatus(state.Status) && !isTerminalStatus(status) {
+				state.RunRevision++
+			}
 			state.Status = status
 			// Mirror the DB's completed_at stamp on the live handle so the DTO shows
 			// the finish time without a reload (terminal -> stamp once; else clear).

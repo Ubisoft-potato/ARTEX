@@ -90,7 +90,11 @@ func (s *Server) initSideQuestions() {
 	}()
 }
 
-func (s *Server) flushSideSnapshots() {
+func (s *Server) flushSideSnapshots(parents ...context.Context) {
+	parent := context.Background()
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
 	if s.side == nil || s.m.pg == nil {
 		return
 	}
@@ -101,7 +105,7 @@ func (s *Server) flushSideSnapshots() {
 	s.side.pending = map[string]sidequestion.Snapshot{}
 	s.side.mu.Unlock()
 	for key, snap := range pending {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 		err := s.m.pg.SaveSideSnapshot(ctx, snap)
 		cancel()
 		s.side.mu.Lock()

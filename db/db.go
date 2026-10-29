@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
 )
@@ -75,6 +76,11 @@ func withSchemaMigrationLock(ctx context.Context, sqlDB *sql.DB, action func(*sq
 // mutually exclusive with startup DDL while allowing ordinary runtime queries
 // to continue normally.
 func coordinateWithSchemaMigration(tx *sql.Tx) error {
+	// Archive streams and file staging legitimately take longer than ordinary
+	// UI queries; keep a finite, separate transaction budget for this path.
+	if _, err := tx.Exec(`SELECT set_config('statement_timeout','300000',true),set_config('idle_in_transaction_session_timeout','300000',true)`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, schemaMigrationLockKey); err != nil {
 		return fmt.Errorf("coordinate with schema migration: %w", err)
 	}
@@ -106,18 +112,24 @@ func ensureDatabase(dsn string) error {
 	// connect to the postgres maintenance database instead
 	adminDSN := *u
 	adminDSN.Path = "/postgres"
-	admin, err := sql.Open("pgx", adminDSN.String())
+	admin, err := openPostgres(adminDSN.String())
 	if err != nil {
 		return nil // best-effort; let Open surface the real error
 	}
 	defer admin.Close()
-	if err := admin.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
 		return nil
 	}
 	var exists bool
-	_ = admin.QueryRow(`SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
+	_ = admin.QueryRowContext(ctx, `SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
 	if !exists {
-		if _, err := admin.Exec(`CREATE DATABASE "` + dbName + `"`); err != nil {
+		if _, err := admin.ExecContext(ctx, `CREATE DATABASE `+pgx.Identifier{dbName}.Sanitize()); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "42P04" {
+				return nil
+			}
 			return fmt.Errorf("create database %q: %w", dbName, err)
 		}
 	}
@@ -129,11 +141,13 @@ func Open(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
 		return nil, err
 	}
-	sqlDB, err := sql.Open("pgx", dsn)
+	sqlDB, err := openPostgres(dsn)
 	if err != nil {
 		return nil, err
 	}
-	if err := sqlDB.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
@@ -141,8 +155,8 @@ func Open(dsn string) (*DB, error) {
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.
-	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
-		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
+	err = withSchemaMigrationLock(ctx, sqlDB, func(conn *sql.Conn) error {
+		if err := applySchemaWithRetry(ctx, conn, time.Sleep); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
 		if err := d.seedBuiltins(); err != nil {

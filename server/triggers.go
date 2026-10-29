@@ -41,6 +41,11 @@ type triggerReq struct {
 // validateTrigger enforces the shared trigger rules for create/update:
 // at least one condition, and on_tool_call requires a non-empty tool set.
 func validateTrigger(req *triggerReq) string {
+	for _, message := range []string{req.IntervalMessage, req.FindingMessage, req.GoalMessage, req.TaskTimeoutMessage, req.ToolCallMessage, req.TaskCreateMessage} {
+		if len(message) > 64<<10 {
+			return "单条触发消息不能超过 64 KiB"
+		}
+	}
 	if req.IntervalSec == 0 && !req.OnFinding && !req.OnGoalMet && !req.OnTaskTimeout && !req.OnToolCall && !req.OnTaskCreate {
 		return "至少选择一种触发条件(定时/发现finding/目标达成/任务超时/工具调用/任务创建)"
 	}

@@ -18,9 +18,11 @@ import (
 //   ④ 等在跑 worker drain(受 grace) → ⑤ 终局一轮 planner 判定 → ⑥ 定终态(带守卫)
 
 const (
-	settleDrainGrace     = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
-	deadlinePollInterval = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
-	deadlineMaxSleep     = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
+	settleDrainGrace         = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
+	deadlinePollInterval     = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
+	deadlineMaxSleep         = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
+	finalPlannerReadyTimeout = 5 * time.Second
+	finalPlannerTimeout      = 2 * time.Minute
 )
 
 // ---------- settling 状态 ----------
@@ -50,7 +52,7 @@ func (e *Engine) inflightCounter(taskID string) *int64 {
 func (e *Engine) beginTaskOperation(taskID string) bool {
 	e.deleteMu.RLock()
 	defer e.deleteMu.RUnlock()
-	if e.IsDeleting(taskID) {
+	if e.stopping.Load() || e.IsDeleting(taskID) {
 		return false
 	}
 	atomic.AddInt64(e.inflightCounter(taskID), 1)
@@ -129,11 +131,11 @@ func (e *Engine) clockCtx(base context.Context, t *Task, final bool) context.Con
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || t.TimeoutSeconds <= 0 {
+	if t == nil || t.TimeoutSeconds <= 0 || e.stopping.Load() {
 		return
 	}
 	e.deleteMu.RLock()
-	if e.IsDeleting(t.ID) {
+	if e.stopping.Load() || e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
 		return
 	}
@@ -204,6 +206,9 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 
 	// ⑤ 终局一轮 planner(任务超时词,最后目标判定,不产新意图)。
 	met := e.runFinalPlannerRound(ctx, t)
+	if ctx.Err() != nil {
+		return // shutdown is recovered at startup; it is not a timeout verdict
+	}
 	if !e.beginTaskOperation(t.ID) {
 		return
 	}
@@ -215,27 +220,28 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	if met {
 		status = "done"
 	}
-	won, err := e.m.SetTaskStatusGuarded(t.ID, status)
-	switch {
-	case err != nil:
-		log.Printf("[deadline] task %s 落终态失败: %v", t.ID, err)
-	case won:
-		log.Printf("[deadline] task %s 收尾完成,终态=%s", t.ID, status)
-	default:
-		log.Printf("[deadline] task %s 收尾时已是终态,保留原状态", t.ID)
+	if err := e.commitTaskTerminal(ctx, t, status); err != nil {
+		log.Printf("[deadline] task %s 终态等待恢复: %v", t.ID, err)
+		return
 	}
+	log.Printf("[deadline] task %s 收尾完成,终态=%s", t.ID, e.m.TaskStatus(t.ID))
 }
 
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
 func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
+	ctx, cancel := context.WithTimeout(ctx, finalPlannerTimeout)
+	defer cancel()
+	readyCtx, stopReady := context.WithTimeout(ctx, finalPlannerReadyTimeout)
+	defer stopReady()
 	if e.IsDeleting(t.ID) {
 		return false
 	}
 	planner, _ := e.snapshotFor(t)
 	for planner == nil {
-		if sleepCtx(ctx, deadlinePollInterval) {
+		if sleepCtx(readyCtx, deadlinePollInterval) {
+			log.Printf("[deadline] task %s 终局模型不可用，按超时收尾", t.ID)
 			return false
 		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {

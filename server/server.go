@@ -38,9 +38,13 @@ var BuildVersion = "dev"
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	m      *Manager
-	engine *Engine
-	ctx    context.Context
+	m            *Manager
+	engine       *Engine
+	ctx          context.Context
+	cancel       context.CancelCauseFunc
+	backgroundMu sync.Mutex
+	backgroundWG sync.WaitGroup
+	closing      bool
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -79,12 +83,13 @@ type Server struct {
 	// counts in-flight runs per agent (replaces a boolean drain flag); a run's
 	// completion decrements it and re-pumps to fill the freed slot. triggerCfg caches
 	// the agent's last-read策略 so the pump never queries the DB while holding queueMu.
-	// Distinct agents always run concurrently. Queue is in-memory (matches chatBusy); a
-	// restart drops pending fires — the scheduler re-fires from watermarks next tick.
+	// An in-memory window fronts the durable queue. Distinct agents share a global cap;
+	// pending jobs and merged conversations are persisted and recovered on restart.
 	queueMu       sync.Mutex
 	triggerQ      map[string][]triggeredRun
 	triggerActive map[string]int
 	triggerCfg    map[string]triggerBehavior
+	triggerLoaded map[int64]bool
 
 	// profChatAgents caches a per-profile ChatAgent (chat page), keyed by profile id.
 	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
@@ -130,6 +135,8 @@ type provEntry struct {
 // taskID + mergeable let the drainer coalesce several event triggers (finding/goal)
 // from the SAME task into one conversation before it starts (interval fires don't merge).
 type triggeredRun struct {
+	jobIDs    []int64
+	recovered bool
 	agentKey  string
 	title     string
 	message   string // 事件正文(触发语 + 工具/入参/返回等);不含任务描述/目标头
@@ -140,11 +147,12 @@ type triggeredRun struct {
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+	ctx, cancel := context.WithCancelCause(ctx)
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, cancel: cancel, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -154,7 +162,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Last-resort memory valve over the whole service cgroup: reap idle or
 	// oversized process trees (MCP, agent-spawned python/Chromium, …) before
 	// the cgroup and then the host runs out of memory. See server/memguard.go.
-	go s.watchMemoryPressure()
+	s.startBackground(s.watchMemoryPressure)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -228,12 +236,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
-		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
-		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
+		s.startBackground(func() { s.evidenceStore().RunGC(s.ctx) })
+		s.seedPythonInterpreter()                                // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		s.startBackground(func() { newScheduler(s).Run(s.ctx) }) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
+		s.startBackground(s.discoverEmptyMCPsOnStartup)
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -253,9 +261,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
 	s.restoreTaskRuntimes()
-	go s.reconcileConcurrency()
+	s.startBackground(s.reconcileConcurrency)
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	m.mu.Lock()
+	m.servers = append(m.servers, s)
+	m.mu.Unlock()
 	return s
 }
 
@@ -266,6 +277,12 @@ func (s *Server) restoreTaskRuntimes() {
 	// reload tasks persisted on disk so the task list survives a restart, and
 	// restore persisted paused state (so a task paused before restart stays paused).
 	for _, t := range m.LoadExisting() {
+		if err := s.engine.recoverSettlements(s.ctx, t); err != nil {
+			// Never reclaim a run whose saved outcome could not be recovered.
+			log.Printf("[settlement] task %s 恢复失败，暂停任务: %v", t.ID, err)
+			s.engine.Pause(t.ID, agent.AbortPausedOnReload)
+			continue
+		}
 		lifecycle := t.lifecycleSnapshot()
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
@@ -665,6 +682,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
+	mux.HandleFunc("GET /api/triggers/queue", s.triggerQueueStatus)
 	mux.HandleFunc("GET /api/logs", s.getLogs)
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
 	mux.HandleFunc("GET /api/logs/stream", s.streamLogs)
@@ -1549,7 +1567,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// live slot and postpones an unavailable task's pause/queue transition until
 	// the call returns; a nudge lets an idle running task resume promptly.
 	t.Notify()
-	go s.reconcileConcurrency()
+	s.startBackground(s.reconcileConcurrency)
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{
 		"id": t.ID, "llm_profile_ids": llmState.ProfileIDs,
@@ -2976,60 +2994,68 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 
 	// Emit a standard SSE id: line so the browser echoes it as Last-Event-ID on
 	// auto-reconnect (see cursor precedence above).
-	sendSSE := func(a db.Activity) {
-		b, _ := json.Marshal(activityDTO(a))
-		fmt.Fprintf(w, "id: %d\ndata: %s\n\n", a.ID, b)
-		flusher.Flush()
+	controller := http.NewResponseController(w)
+	writeFrame := func(frame string) error {
+		_ = controller.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		defer controller.SetWriteDeadline(time.Time{})
+		if _, err := fmt.Fprint(w, frame); err != nil {
+			return err
+		}
+		return controller.Flush()
 	}
-
-	// Compensate the DB backlog after `since` in batches until caught up. This is the
-	// gap between the history snapshot and the live tail — NOT the first-page history
-	// (that's the /activity/history endpoint). A long task can have far more than one
-	// batch, so loop instead of a single fixed read; on a query error log it and close
-	// so the client reconnects and retries from its last id (broadcast is lossy — the
-	// DB is the source of truth). The Broadcaster keeps buffering live events meanwhile;
-	// the id<=since skip below drops any that this replay already covered.
-	const replayBatch = 500
-	for {
-		items, cursor, err := t.Store.ActivityList(intentPtr, since, replayBatch)
-		if err != nil {
-			log.Printf("[activity/stream] task=%s replay since=%d: %v", t.ID, since, err)
-			return
+	replay := func() error {
+		for {
+			items, _, err := t.Store.ActivityListContext(r.Context(), intentPtr, since, 500)
+			if err != nil {
+				return err
+			}
+			for _, a := range items {
+				b, err := json.Marshal(activityDTO(a))
+				if err != nil {
+					return err
+				}
+				if err := writeFrame(fmt.Sprintf("id: %d\ndata: %s\n\n", a.ID, b)); err != nil {
+					return err
+				}
+				since = a.ID
+			}
+			if len(items) < 500 {
+				return nil
+			}
 		}
-		for _, a := range items {
-			sendSSE(a)
-		}
-		if cursor > since {
-			since = cursor
-		}
-		if len(items) < replayBatch {
-			break
-		}
+	}
+	if err := replay(); err != nil {
+		log.Printf("[activity/stream] task=%s replay: %v", t.ID, err)
+		return
 	}
 	flusher.Flush()
-
-	ctx := r.Context()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-r.Context().Done():
 			return
-		case a, ok := <-ch:
+		case <-s.ctx.Done():
+			return
+		case _, ok := <-ch:
+			// Broadcast is only a wake-up. Read committed rows in order, even when
+			// concurrent publishers reached the channel in a different order.
+			if err := replay(); err != nil {
+				return
+			}
 			if !ok {
 				return
 			}
-			if a.ID <= since {
-				continue // already replayed
+			for len(ch) > 0 {
+				<-ch
 			}
-			if intentPtr != nil && (a.NodeID == nil || *a.NodeID != *intentPtr) {
-				continue // scoped session: only this intent's steps
-			}
-			since = a.ID
-			sendSSE(a)
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
-			flusher.Flush()
+			if err := replay(); err != nil {
+				return
+			}
+			if err := writeFrame(": ping\n\n"); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -3338,7 +3364,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
-		go s.reconcileConcurrency()
+		s.startBackground(s.reconcileConcurrency)
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {

@@ -35,21 +35,22 @@ func (b *Broadcaster) Subscribe(task string) (<-chan db.Activity, func()) {
 		once.Do(func() {
 			b.mu.Lock()
 			if m := b.subs[task]; m != nil {
-				delete(m, ch)
+				if _, ok := m[ch]; ok {
+					delete(m, ch)
+					close(ch)
+				}
 				if len(m) == 0 {
 					delete(b.subs, task)
 				}
 			}
 			b.mu.Unlock()
-			close(ch)
 		})
 	}
 }
 
 // Publish fans an activity out to all subscribers of a task. Non-blocking: if a
-// subscriber's buffer is full the event is dropped — the client reconnects with
-// its last seq cursor and catches up the gap from the DB, so liveness never
-// stalls the engine.
+// subscriber's buffer fills, disconnect it before any later cursor can pass the
+// missing record. Reconnection catches up from PostgreSQL without stalling work.
 func (b *Broadcaster) Publish(task string, a db.Activity) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -57,6 +58,13 @@ func (b *Broadcaster) Publish(task string, a db.Activity) {
 		select {
 		case ch <- a:
 		default:
+			// Disconnect at the first overflow. Keeping the stream alive would
+			// allow a later event to move its cursor past this missing record.
+			delete(b.subs[task], ch)
+			close(ch)
 		}
+	}
+	if len(b.subs[task]) == 0 {
+		delete(b.subs, task)
 	}
 }

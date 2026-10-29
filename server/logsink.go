@@ -40,6 +40,7 @@ type logSinkT struct {
 	out  io.Writer // passthrough (stderr)
 
 	dbOnce sync.Once
+	dbDone chan struct{}
 	dbCh   chan dbWriteReq // buffered async channel; nil until SetDB is called
 }
 
@@ -61,6 +62,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 		ch := make(chan dbWriteReq, 2000)
 		s.mu.Lock()
 		s.dbCh = ch
+		s.dbDone = make(chan struct{})
 		s.mu.Unlock()
 
 		// Restore last 100 rows from DB → prepend to ring as history context.
@@ -86,32 +88,23 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 			s.mu.Unlock()
 		}
 
-		// Async writer: picks from channel and inserts into server_logs.
-		// Uses os.Stderr directly to report errors and avoids recursive log calls.
+		// Keep accepting final logs until Shutdown explicitly closes the queue.
 		go func() {
-			for {
-				select {
-				case req, ok := <-ch:
-					if !ok {
-						return
-					}
-					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, req.ll.Text)
-					if err != nil {
-						_, _ = os.Stderr.Write([]byte("[logsink] db write: " + err.Error() + "\n"))
-						continue
-					}
-					// Stamp DBID back into the ring entry so history pagination works.
-					s.mu.Lock()
-					for i := range s.ring {
-						if s.ring[i].Seq == req.seq {
-							s.ring[i].DBID = id
-							break
-						}
-					}
-					s.mu.Unlock()
-				case <-ctx.Done():
-					return
+			defer close(s.dbDone)
+			for req := range ch {
+				id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, req.ll.Text)
+				if err != nil {
+					_, _ = os.Stderr.Write([]byte("[logsink] db write: " + err.Error() + "\n"))
+					continue
 				}
+				s.mu.Lock()
+				for i := range s.ring {
+					if s.ring[i].Seq == req.seq {
+						s.ring[i].DBID = id
+						break
+					}
+				}
+				s.mu.Unlock()
 			}
 		}()
 	})
@@ -135,27 +128,21 @@ func (s *logSinkT) add(l LogLine) {
 	if len(s.ring) > s.cap {
 		s.ring = s.ring[len(s.ring)-s.cap:]
 	}
-	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
-	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
-	s.mu.Unlock()
-
-	// Async DB write (non-blocking; drops if channel is full under extreme load).
-	if ch != nil {
+	if s.dbCh != nil {
 		select {
-		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
+		case s.dbCh <- dbWriteReq{seq: l.Seq, ll: l}:
 		default:
 		}
 	}
-
-	for _, sub := range subs {
+	for sub := range s.subs {
 		select {
 		case sub <- l:
 		default:
+			delete(s.subs, sub)
+			close(sub)
 		}
 	}
+	s.mu.Unlock()
 }
 
 // recent returns ring lines with Seq > since (capped to limit), and the latest seq.
@@ -186,9 +173,11 @@ func (s *logSinkT) subscribe() (<-chan LogLine, func()) {
 	return ch, func() {
 		once.Do(func() {
 			s.mu.Lock()
-			delete(s.subs, ch)
+			if _, ok := s.subs[ch]; ok {
+				delete(s.subs, ch)
+				close(ch)
+			}
 			s.mu.Unlock()
-			close(ch)
 		})
 	}
 }
@@ -223,4 +212,23 @@ func levelOf(msg string) string {
 		}
 	}
 	return "info"
+}
+
+func (s *Server) flushLogs(ctx context.Context) error {
+	logSink.mu.Lock()
+	if logSink.dbCh != nil {
+		close(logSink.dbCh)
+		logSink.dbCh = nil
+	}
+	done := logSink.dbDone
+	logSink.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

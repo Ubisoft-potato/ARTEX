@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -65,22 +66,23 @@ func jsonbClean(b []byte) []byte {
 
 // Node is a typed reasoning node (= old task_nodes). kind ∈ goal|intent|finding|hint.
 type Node struct {
-	FindingID     int64           `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
-	FindingNodeID int64           `json:"finding_node_id,omitempty"`
-	TrafficCount  int             `json:"traffic_count,omitempty"`
-	ID            int64           `json:"id"`
-	Kind          string          `json:"kind"`
-	Payload       json.RawMessage `json:"payload"`
-	Priority      int             `json:"priority"`
-	State         string          `json:"state"`
-	Origin        string          `json:"origin,omitempty"`
-	Owner         string          `json:"owner,omitempty"`
-	BlockedReason string          `json:"blocked_reason,omitempty"`
-	DeleteReason  string          `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
-	Anchors       []int64         `json:"anchors,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	SourceTaskID  int64           `json:"source_task_id,omitempty"`
-	Inherited     bool            `json:"inherited,omitempty"`
+	ExecutionToken string          `json:"-"`
+	FindingID      int64           `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
+	FindingNodeID  int64           `json:"finding_node_id,omitempty"`
+	TrafficCount   int             `json:"traffic_count,omitempty"`
+	ID             int64           `json:"id"`
+	Kind           string          `json:"kind"`
+	Payload        json.RawMessage `json:"payload"`
+	Priority       int             `json:"priority"`
+	State          string          `json:"state"`
+	Origin         string          `json:"origin,omitempty"`
+	Owner          string          `json:"owner,omitempty"`
+	BlockedReason  string          `json:"blocked_reason,omitempty"`
+	DeleteReason   string          `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
+	Anchors        []int64         `json:"anchors,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	SourceTaskID   int64           `json:"source_task_id,omitempty"`
+	Inherited      bool            `json:"inherited,omitempty"`
 }
 
 // Activity is one worker execution step (= old task_activity).
@@ -438,6 +440,9 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		return out, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(-$1::bigint)`, s.expID); err != nil {
+		return out, err
+	}
 
 	// 锁定意图行确认存在(幂等:已删则 not found)。状态不校验——真删除对任何状态成立,
 	// running 的 worker 由调用方先停。
@@ -1127,6 +1132,12 @@ func (s *ExplorationStore) FindingIntentsTerminal() (map[int64]int64, error) {
 // are excluded — they remain in state 'open' but are not yet claimable by workers.
 // Old intents without depends_on in their payload pass through unchanged (NULL check).
 func (s *ExplorationStore) Frontier(limit int) ([]*Node, error) {
+	ctx, cancel := BoundedContext(context.Background())
+	defer cancel()
+	return s.FrontierContext(ctx, limit)
+}
+
+func (s *ExplorationStore) FrontierContext(ctx context.Context, limit int) ([]*Node, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -1135,7 +1146,7 @@ func (s *ExplorationStore) Frontier(limit int) ([]*Node, error) {
 	//   jsonb_array_length(...) = 0            → empty array, always pass
 	//   NOT EXISTS (SELECT 1 FROM ... dep_id ...)
 	//     finds any dep whose state != 'done'  → blocks entry if any dep is not done
-	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'
   AND (
     payload->'depends_on' IS NULL
@@ -1214,17 +1225,36 @@ func (s *ExplorationStore) Stats() (map[string]int, error) {
 
 // AppendActivity records one worker step and returns its id.
 func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
+	ctx, cancel := BoundedContext(context.Background())
+	defer cancel()
+	return s.AppendActivityContext(ctx, a)
+}
+
+func (s *ExplorationStore) AppendActivityContext(ctx context.Context, a Activity) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	// Serialize ID allocation with commit within an exploration. A later
+	// committed cursor must never hide an earlier still-uncommitted activity.
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(-$1::bigint)`, s.expID); err != nil {
+		return 0, err
+	}
 	metadata := a.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
 		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 // ExplorationDiag probes, at the moment of an activity FK violation (23503), why the
@@ -1467,6 +1497,12 @@ func (s *ExplorationStore) TokenStatsBySession() ([]SessionTokenUsage, error) {
 // ActivityList returns steps after sinceID (exclusive), optionally filtered by node.
 // Returns items and the new cursor (max id seen).
 func (s *ExplorationStore) ActivityList(nodeID *int64, sinceID int64, limit int) ([]Activity, int64, error) {
+	return s.ActivityListContext(context.Background(), nodeID, sinceID, limit)
+}
+
+func (s *ExplorationStore) ActivityListContext(parent context.Context, nodeID *int64, sinceID int64, limit int) ([]Activity, int64, error) {
+	ctx, cancel := BoundedContext(parent)
+	defer cancel()
 	if limit <= 0 {
 		limit = 300
 	}
@@ -1474,10 +1510,10 @@ func (s *ExplorationStore) ActivityList(nodeID *int64, sinceID int64, limit int)
 	var err error
 	const cols = `id, node_id, COALESCE(worker,''), COALESCE(kind,''), COALESCE(tool,''), COALESCE(tool_use_id,''), is_error, COALESCE(summary,''), metadata, created_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg`
 	if nodeID != nil {
-		rows, err = s.db.Query(`SELECT `+cols+`
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+`
 FROM activity WHERE exploration_id=$1 AND node_id=$2 AND id>$3 ORDER BY id LIMIT $4`, s.expID, *nodeID, sinceID, limit)
 	} else {
-		rows, err = s.db.Query(`SELECT `+cols+`
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+`
 FROM activity WHERE exploration_id=$1 AND id>$2 ORDER BY id LIMIT $3`, s.expID, sinceID, limit)
 	}
 	if err != nil {

@@ -245,6 +245,8 @@ DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS execution_token TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS exploration_edges (
     exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
     src_id         BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
@@ -533,6 +535,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_revision BIGINT NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION advance_artex_task_run() RETURNS trigger AS $$
+BEGIN
+ IF OLD.status IN ('done','failed','timeout') AND NEW.status NOT IN ('done','failed','timeout') THEN
+  NEW.run_revision := OLD.run_revision+1;
+ END IF;
+ RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_artex_task_run ON tasks;
+CREATE TRIGGER trg_artex_task_run BEFORE UPDATE OF status ON tasks
+ FOR EACH ROW EXECUTE FUNCTION advance_artex_task_run();
 CREATE INDEX IF NOT EXISTS idx_tasks_alive  ON tasks(created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)          WHERE deleted_at IS NULL;
 DROP TRIGGER IF EXISTS trg_tasks_upd ON tasks;
@@ -1020,6 +1034,104 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
 );
+
+-- Durable P3 delivery queue. Source mutations enqueue in their own transaction;
+-- consumption never relies on task IDs or sequence allocation/commit order.
+CREATE TABLE IF NOT EXISTS trigger_jobs (
+ id BIGSERIAL PRIMARY KEY,
+ trigger_id BIGINT NOT NULL DEFAULT 0,
+ event_key TEXT NOT NULL,
+ agent_key TEXT NOT NULL,
+ payload JSONB NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','running','merged','completed','failed','expired','rejected')),
+ group_id BIGINT,
+ conversation_id BIGINT,
+ attempts INT NOT NULL DEFAULT 0,
+ available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ last_error TEXT NOT NULL DEFAULT '',
+ UNIQUE(trigger_id,event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_trigger_jobs_pending ON trigger_jobs(available_at,id) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS idx_trigger_jobs_agent ON trigger_jobs(agent_key,state,id);
+CREATE INDEX IF NOT EXISTS idx_trigger_jobs_group ON trigger_jobs(group_id);
+
+CREATE OR REPLACE FUNCTION bound_artex_trigger_queue() RETURNS trigger AS $$
+BEGIN
+ PERFORM pg_advisory_xact_lock(7337741006);
+ IF octet_length(NEW.payload::text)>131072 THEN
+  NEW.state := 'rejected'; NEW.last_error := '触发输入超过 128 KiB';
+ ELSIF (SELECT count(*) FROM trigger_jobs WHERE state='pending')>=1000 THEN
+  NEW.state := 'rejected'; NEW.last_error := '触发队列已达 1000 条上限';
+ END IF;
+ RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_artex_trigger_capacity ON trigger_jobs;
+CREATE TRIGGER trg_artex_trigger_capacity BEFORE INSERT ON trigger_jobs
+ FOR EACH ROW EXECUTE FUNCTION bound_artex_trigger_queue();
+
+CREATE OR REPLACE FUNCTION enqueue_artex_trigger_event() RETURNS trigger AS $$
+DECLARE
+ event_kind TEXT; delivery_key TEXT; tid BIGINT; descr TEXT; goal TEXT;
+ event_body TEXT; event_title TEXT; tool_name TEXT := ''; tool_error BOOLEAN := false;
+BEGIN
+ IF current_setting('artex.restore_mode',true)='on' THEN RETURN NEW; END IF;
+ IF TG_TABLE_NAME='tasks' THEN
+  tid := NEW.id; descr := NEW.description; goal := NEW.goal;
+  IF TG_OP='INSERT' THEN
+   event_kind := 'task_create'; delivery_key := 'create:'||NEW.id;
+   event_title := '任务创建触发'; event_body := '【本次由任务创建触发】';
+  ELSIF NEW.status='timeout' AND OLD.status IS DISTINCT FROM NEW.status THEN
+   event_kind := 'timeout'; delivery_key := 'timeout:'||NEW.id||':'||NEW.run_revision;
+   event_title := '超时触发'; event_body := '【本次由任务超时触发】';
+  ELSE RETURN NEW; END IF;
+ ELSIF TG_TABLE_NAME='exploration_nodes' THEN
+  IF NEW.kind='finding' AND TG_OP='INSERT' THEN
+   event_kind := 'finding'; delivery_key := 'finding:'||NEW.id;
+   event_title := 'finding 触发';
+   event_body := '【本次由任务发现 finding 触发】'||E'\n'||left(COALESCE(NEW.payload->>'summary',''),4000);
+  ELSIF NEW.kind='goal' AND NEW.state='met' AND (TG_OP='INSERT' OR OLD.state IS DISTINCT FROM NEW.state) THEN
+   event_kind := 'goal'; delivery_key := 'goal:'||NEW.id||':'||NEW.updated_at::text;
+   event_title := '目标触发';
+   event_body := '【本次由任务完成目标触发】'||E'\n'||left(COALESCE(NEW.payload->>'summary',''),4000);
+  ELSE RETURN NEW; END IF;
+  SELECT id,description,tasks.goal INTO tid,descr,goal FROM tasks WHERE exploration_id=NEW.exploration_id AND deleted_at IS NULL;
+ ELSE
+  IF NEW.kind IS DISTINCT FROM 'tool_result' OR COALESCE(NEW.tool,'')='' OR (NEW.tool='report_finding' AND NEW.is_error) THEN RETURN NEW; END IF;
+  tool_name := NEW.tool; tool_error := NEW.is_error;
+  event_kind := 'tool'; delivery_key := 'tool:'||NEW.id;
+  event_title := '工具触发 · '||NEW.tool;
+  SELECT id,description,tasks.goal INTO tid,descr,goal FROM tasks WHERE exploration_id=NEW.exploration_id AND deleted_at IS NULL;
+  event_body := '【本次由工具调用触发】'||E'\n工具: '||NEW.tool||E'\n入参: '||
+   COALESCE((SELECT left(detail,1500) FROM activity WHERE exploration_id=NEW.exploration_id AND tool_use_id=NEW.tool_use_id AND kind='tool_use' ORDER BY id DESC LIMIT 1),'')||
+   E'\n返回: '||CASE WHEN tool_error THEN '[error] ' ELSE '' END||left(COALESCE(NEW.detail,''),1500);
+ END IF;
+ IF tid IS NULL THEN RETURN NEW; END IF;
+ INSERT INTO trigger_jobs(trigger_id,event_key,agent_key,payload)
+ SELECT tr.id,delivery_key,tr.agent_key,jsonb_build_object(
+  'agent_key',tr.agent_key,'title',event_title||' · task#'||tid,
+  'message',CASE event_kind WHEN 'finding' THEN tr.finding_message WHEN 'goal' THEN tr.goal_message
+    WHEN 'timeout' THEN tr.task_timeout_message WHEN 'tool' THEN tr.tool_call_message ELSE tr.task_create_message END||E'\n\n'||event_body,
+  'task_id',tid,'task_desc',left(descr,200),'task_goal',left(goal,500),'mergeable',true)
+ FROM agent_triggers tr WHERE tr.enabled AND
+  CASE event_kind WHEN 'finding' THEN tr.on_finding WHEN 'goal' THEN tr.on_goal_met
+   WHEN 'timeout' THEN tr.on_task_timeout WHEN 'task_create' THEN tr.on_task_create
+   ELSE tr.on_tool_call AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN tr.tool_names='' THEN '[]'::jsonb ELSE tr.tool_names::jsonb END) n WHERE lower(n)=lower(tool_name)) END
+ ON CONFLICT(trigger_id,event_key) DO NOTHING;
+ RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_artex_task_events ON tasks;
+CREATE TRIGGER trg_artex_task_events AFTER INSERT OR UPDATE OF status ON tasks
+ FOR EACH ROW EXECUTE FUNCTION enqueue_artex_trigger_event();
+DROP TRIGGER IF EXISTS trg_artex_node_events ON exploration_nodes;
+CREATE TRIGGER trg_artex_node_events AFTER INSERT OR UPDATE OF state ON exploration_nodes
+ FOR EACH ROW EXECUTE FUNCTION enqueue_artex_trigger_event();
+DROP TRIGGER IF EXISTS trg_artex_tool_events ON activity;
+CREATE TRIGGER trg_artex_tool_events AFTER INSERT ON activity
+ FOR EACH ROW EXECUTE FUNCTION enqueue_artex_trigger_event();
 
 -- =====================================================================
 -- K. 拦截规则

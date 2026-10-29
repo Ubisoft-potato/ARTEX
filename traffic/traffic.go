@@ -262,6 +262,9 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 // index, so shutdown never leaves a goroutine unlinking files out from under a
 // removed data directory.
 func (t *Traffic) Close() error {
+	if t.proxy != nil {
+		_ = t.proxy.Close()
+	}
 	t.reaping.Wait()
 	return t.db.Close()
 }

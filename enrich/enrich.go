@@ -7,6 +7,7 @@
 package enrich
 
 import (
+	"context"
 	"crypto/tls"
 	"html"
 	"io"
@@ -48,6 +49,9 @@ type Engine struct {
 	cool   sync.Map // dedup/cooldown: "kind:id" -> time.Time (last run)
 	once   sync.Once
 	closed chan struct{}
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 const (
@@ -74,7 +78,8 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 		log.Printf("[enrich] dnsx 初始化失败，DNS 解析停用：%v", err)
 		resolv = nil
 	}
-	e := &Engine{
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Engine{ctx: ctx, cancel: cancel,
 		as:     as,
 		resolv: resolv,
 		client: buildClient(proxy),
@@ -82,7 +87,8 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 		closed: make(chan struct{}),
 	}
 	for i := 0; i < workers; i++ {
-		go e.worker()
+		e.wg.Add(1)
+		go func() { defer e.wg.Done(); e.worker() }()
 	}
 	return e
 }
@@ -136,10 +142,23 @@ func id0(id int64) bool { return id <= 0 }
 
 // Close stops the workers (idempotent).
 func (e *Engine) Close() {
+	_ = e.CloseContext(context.Background())
+}
+
+func (e *Engine) CloseContext(ctx context.Context) error {
 	if e == nil {
-		return
+		return nil
 	}
-	e.once.Do(func() { close(e.closed) })
+	e.once.Do(func() { close(e.closed); e.cancel() })
+	done := make(chan struct{})
+	go func() { e.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	e.client.CloseIdleConnections()
+	return nil
 }
 
 func (e *Engine) worker() {
@@ -226,7 +245,7 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	if host == "" {
 		return
 	}
-	req, err := http.NewRequest("GET", rawURL, nil)
+	req, err := http.NewRequestWithContext(e.ctx, "GET", rawURL, nil)
 	if err != nil {
 		return
 	}

@@ -367,23 +367,26 @@ func TestFindingTrafficFailedReportDoesNotTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var last int64
-	if err = s.m.pg.QueryRow(`SELECT COALESCE(max(id),0) FROM activity`).Scan(&last); err != nil {
+	tr, err := s.m.pg.CreateTrigger(&db.AgentTrigger{AgentKey: "failed-finding-regression", Enabled: true, OnToolCall: true, ToolNames: []string{"report_finding"}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.m.pg.SetSchedState(schedKeyLastToolCall, strconv.FormatInt(last, 10)); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() {
+		s.m.pg.Exec(`DELETE FROM trigger_jobs WHERE trigger_id=$1`, tr.ID)
+		s.m.pg.DeleteTrigger(tr.ID)
+	})
 	id, err := s.m.pg.Exploration(task.ExplorationID).AppendActivity(db.Activity{Kind: "tool_result", Tool: "report_finding", ToolUseID: "failure-fixture", IsError: true, Detail: "body missing"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A nil server makes any attempted trigger fail this test immediately.
-	scheduler := &Scheduler{pg: s.m.pg}
-	scheduler.fireToolCalls([]*db.AgentTrigger{{OnToolCall: true, ToolNames: []string{"report_finding"}, AgentKey: "reporter"}})
-	if got := scheduler.mustState(schedKeyLastToolCall); got != strconv.FormatInt(id, 10) {
-		t.Fatal("failed finding must still advance watermark", got)
+	var count int
+	if err := s.m.pg.QueryRow(`SELECT count(*) FROM trigger_jobs WHERE trigger_id=$1 AND event_key=$2`, tr.ID, fmt.Sprintf("tool:%d", id)).Scan(&count); err != nil {
+		t.Fatal(err)
 	}
+	if count != 0 {
+		t.Fatal("failed finding created an automation event")
+	}
+
 }
 
 func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {

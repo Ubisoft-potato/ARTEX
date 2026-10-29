@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/google/uuid"
 )
 
 const (
@@ -469,16 +469,22 @@ func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMe
 	if len(userMessage) == 1 {
 		ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: userMessage[0]})
 	}
-	go s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+	if !s.startBackground(func() { s.runConversationTurn(ctx, cancel, c, msg, busyKey) }) {
+		cancel(agent.AbortShutdown)
+		s.chatMu.Lock()
+		delete(s.chatBusy, busyKey)
+		delete(s.chatCancel, busyKey)
+		s.chatMu.Unlock()
+	}
 }
 
 // runConversationSync runs ONE agent turn on a conversation and BLOCKS until the
 // run ends (clearing busyKey). runConversation wraps it in a goroutine for the
 // fire-and-forget chat path; the P3 trigger queue calls it directly so it can wait
 // for completion before starting the next queued fire for the same agent.
-func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
+func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) error {
 	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
-	s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+	return s.runConversationTurn(ctx, cancel, c, msg, busyKey)
 }
 
 // Register cancellation before returning 202, so an immediate stop/delete cannot
@@ -493,7 +499,8 @@ func (s *Server) conversationRunContext(id int64, busyKey string) (context.Conte
 	return ctx, cancel
 }
 
-func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelCauseFunc, c *db.Conversation, msg, busyKey string) {
+func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelCauseFunc, c *db.Conversation, msg, busyKey string) (runErr error) {
+	runErr = errors.New("对话未完成")
 	defer func() {
 		cancel(agent.AbortChatTurnFinished)
 		s.chatMu.Lock()
@@ -562,14 +569,17 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
 		finishReason = err.Error()
+		runErr = err
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
 				Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
 		}
 	} else {
 		finishStatus, finishReason = "completed", ""
+		runErr = nil
 	}
 	_ = pg.TouchConversation(c.ID)
+	return
 }
 
 // triggerBehavior is an agent's cached P3 trigger post-processing策略 (see the
@@ -608,15 +618,15 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 // merging by task / all / none); parallel → run each fire in its own concurrent
 // conversation up to trigger_max_parallel. Distinct agents always run concurrently.
 func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string) {
-	if s.m.pg == nil || s.chatAgentRef() == nil {
+	if s.m.pg == nil || s.ctx.Err() != nil {
 		return
 	}
-	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
-	s.queueMu.Lock()
-	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
-	s.pumpLocked(agentKey)
-	s.queueMu.Unlock()
+	item := triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable}
+	if err := s.m.pg.EnqueueTriggerJob(s.ctx, uuid.NewString(), triggerPayload(item)); err != nil {
+		log.Printf("[trigger] 持久化触发失败: %v", err)
+		return
+	}
+	s.loadTriggerQueue()
 }
 
 // pumpLocked launches queued fires for one agent up to its concurrency limit, then
@@ -629,16 +639,22 @@ func (s *Server) pumpLocked(agentKey string) {
 	}
 	cfg := s.triggerCfg[agentKey]
 	limit := 1
+	total := 0
+	for _, n := range s.triggerActive {
+		total += n
+	}
+	globalLimit := 8
 	if cfg.runMode == "parallel" {
 		if cfg.maxParallel <= 0 {
-			limit = math.MaxInt
+			limit = globalLimit
 		} else {
 			limit = cfg.maxParallel
 		}
 	}
-	for s.triggerActive[agentKey] < limit && len(s.triggerQ[agentKey]) > 0 {
+	for total < globalLimit && s.triggerActive[agentKey] < limit && len(s.triggerQ[agentKey]) > 0 {
 		item := s.nextTriggerRun(agentKey, cfg)
 		s.triggerActive[agentKey]++
+		total++
 		go s.runAndPump(agentKey, item)
 	}
 }
@@ -646,15 +662,20 @@ func (s *Server) pumpLocked(agentKey string) {
 // runAndPump runs one fire to completion, then decrements the active counter and
 // re-pumps to fill the freed slot (cleaning up the agent's maps when fully idle).
 func (s *Server) runAndPump(agentKey string, item triggeredRun) {
-	s.runTriggeredRun(item)
+	err := s.runTriggeredRun(item)
+	s.finishTrigger(item, err)
 	s.queueMu.Lock()
+	for _, id := range item.jobIDs {
+		delete(s.triggerLoaded, id)
+	}
 	s.triggerActive[agentKey]--
 	if s.triggerActive[agentKey] <= 0 && len(s.triggerQ[agentKey]) == 0 {
 		delete(s.triggerActive, agentKey)
 		delete(s.triggerQ, agentKey)
 		delete(s.triggerCfg, agentKey)
-	} else {
-		s.pumpLocked(agentKey)
+	}
+	for key := range s.triggerQ {
+		s.pumpLocked(key)
 	}
 	s.queueMu.Unlock()
 }
@@ -668,13 +689,21 @@ func (s *Server) runAndPump(agentKey string, item triggeredRun) {
 // Caller holds queueMu.
 func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredRun {
 	q := s.triggerQ[agentKey]
-	if cfg.runMode == "parallel" || cfg.mergeMode == "none" {
+	if cfg.runMode == "parallel" || cfg.mergeMode == "none" || q[0].recovered {
 		s.triggerQ[agentKey] = q[1:]
 		return q[0]
 	}
 	if cfg.mergeMode == "all" {
-		s.triggerQ[agentKey] = q[:0:0]
-		return mergeAllRuns(q)
+		n, size := 0, 0
+		for n < len(q) && n < 64 && !q[n].recovered {
+			if n > 0 && size+len(q[n].message) > 256<<10 {
+				break
+			}
+			size += len(q[n].message)
+			n++
+		}
+		s.triggerQ[agentKey] = q[n:]
+		return mergeAllRuns(q[:n])
 	}
 	// by_task: head + same-task mergeable fires.
 	head := q[0]
@@ -685,7 +714,7 @@ func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredR
 	group := []triggeredRun{head}
 	rest := q[:0:0] // keep non-matching items in order
 	for _, it := range q[1:] {
-		if it.mergeable && it.taskID == head.taskID {
+		if !it.recovered && it.mergeable && it.taskID == head.taskID && len(group) < 64 && len(finalTriggerMessage(mergeTriggeredRuns(group)))+len(it.message) <= 256<<10 {
 			group = append(group, it)
 		} else {
 			rest = append(rest, it)
@@ -741,6 +770,7 @@ func mergeTriggeredRuns(items []triggeredRun) triggeredRun {
 		fmt.Fprintf(&b, "\n── 触发 %d ──\n%s\n", i+1, it.message)
 	}
 	return triggeredRun{
+		jobIDs:    mergedJobIDs(items),
 		agentKey:  first.agentKey,
 		title:     fmt.Sprintf("合并触发 · task#%d · %d 条", first.taskID, len(items)),
 		message:   b.String(),
@@ -783,6 +813,7 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 		}
 	}
 	return triggeredRun{
+		jobIDs:    mergedJobIDs(items),
 		agentKey:  first.agentKey,
 		title:     fmt.Sprintf("合并触发 · 全部 · %d 条", len(items)),
 		message:   b.String(),
@@ -795,27 +826,28 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 // runTriggeredRun creates the conversation for one queued fire, records the human
 // turn, and runs it synchronously (blocks until the run ends). recover keeps a
 // panic from killing the drain loop and wedging the agent's queue.
-func (s *Server) runTriggeredRun(item triggeredRun) {
+func (s *Server) runTriggeredRun(item triggeredRun) (runErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[trigger] run for %s panicked: %v", item.agentKey, r)
+			runErr = fmt.Errorf("trigger panic: %v", r)
 		}
 	}()
-	pg := s.m.pg
-	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+	msg := finalTriggerMessage(item)
+	payload := triggerPayload(item)
+	payload.Message = msg
+	payload.TaskDesc, payload.TaskGoal = "", ""
+	c, err := s.m.pg.PrepareTriggerRun(s.ctx, item.jobIDs, payload)
 	if err != nil {
-		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
-		return
+		return err
 	}
-	msg := finalTriggerMessage(item) // prepend the task-context header for single (non-merged) fires
-	if _, err := pg.AppendConvActivity(c.ID, db.Activity{Worker: item.agentKey, Kind: "user", Summary: firstLine(msg, 200), Detail: msg}); err != nil {
-		log.Printf("[trigger] append msg failed: %v", err)
+	if item.recovered {
+		msg = "上次触发执行中断。请结合原会话已有结果继续，避免重复已完成的操作。"
 	}
 	busyKey := s.convBusyKey(c.ID)
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
-	s.runConversationSync(c, msg, busyKey)
+	return s.runConversationSync(c, msg, busyKey)
 }
 
 // firstLine returns a single-line, length-capped preview (shared with summaries).

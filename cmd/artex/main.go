@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -105,7 +106,12 @@ func run() int {
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
 	}
-	defer mgr.Close()
+	closeStores := true
+	defer func() {
+		if closeStores {
+			_ = mgr.Close()
+		}
+	}()
 
 	// Surviving this long means a freshly swapped-in build actually works, so drop
 	// the upgrade marker and stop counting attempts. Until it fires, every boot
@@ -123,12 +129,14 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
+	serveErr := make(chan error, 1)
 	go func() {
 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("serve: %v", err)
+			serveErr <- err
 		}
 	}()
 
@@ -138,15 +146,26 @@ func run() int {
 	code := 0
 	select {
 	case <-ctx.Done():
+	case err := <-serveErr:
+		log.Printf("serve: %v", err)
+		code = 1
+		shutdown(agent.AbortShutdown)
 	case <-server.RestartRequested():
 		code = selfupdate.ExitRestart
 		shutdown(agent.AbortShutdown)
 	}
 
 	log.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+		_ = httpSrv.Close()
+	}
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		closeStores = false
+		log.Printf("后台收尾超时，保留恢复凭据并交由进程退出释放存储: %v", err)
+	}
 	return code
 }
 
