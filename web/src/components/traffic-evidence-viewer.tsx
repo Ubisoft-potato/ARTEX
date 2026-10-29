@@ -69,7 +69,7 @@ export function TrafficEvidenceViewer({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
+      <DialogContent className="max-h-[90dvh] min-w-0 overflow-x-hidden overflow-y-auto sm:max-w-4xl">
         <DialogHeader>
           <DialogTitle>流量证据 #{bindingId}</DialogTitle>
           <DialogDescription className="break-all">
@@ -81,13 +81,13 @@ export function TrafficEvidenceViewer({
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         ) : detail ? (
-          <Tabs defaultValue="request">
+          <Tabs defaultValue="request" className="min-w-0">
             <TabsList>
               <TabsTrigger value="request">请求 Request</TabsTrigger>
               <TabsTrigger value="response">响应 Response</TabsTrigger>
             </TabsList>
             {(["request", "response"] as const).map((side) => (
-              <TabsContent key={side} value={side}>
+              <TabsContent key={side} value={side} className="min-w-0">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-muted-foreground">
                     正文 {detail[side].total.toLocaleString()} 字节{detail[side].truncated ? " · 当前为预览" : ""}
@@ -150,7 +150,7 @@ export function CapturedTrafficViewer({ id, onClose }: { id: string | null; onCl
         if (!open) onClose();
       }}
     >
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
+      <DialogContent className="max-h-[90dvh] min-w-0 overflow-x-hidden overflow-y-auto sm:max-w-4xl">
         <DialogHeader>
           <DialogTitle>预览流量</DialogTitle>
           <DialogDescription>流量 ID：{id}。绑定时会保存完整正文。</DialogDescription>
@@ -160,15 +160,15 @@ export function CapturedTrafficViewer({ id, onClose }: { id: string | null; onCl
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         ) : detail ? (
-          <Tabs defaultValue="request">
+          <Tabs defaultValue="request" className="min-w-0">
             <TabsList>
               <TabsTrigger value="request">请求 Request</TabsTrigger>
               <TabsTrigger value="response">响应 Response</TabsTrigger>
             </TabsList>
-            <TabsContent value="request">
+            <TabsContent value="request" className="min-w-0">
               <HttpCodeBlock raw={detail.req} />
             </TabsContent>
-            <TabsContent value="response">
+            <TabsContent value="response" className="min-w-0">
               <HttpCodeBlock raw={detail.resp} />
             </TabsContent>
           </Tabs>

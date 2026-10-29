@@ -96,7 +96,7 @@ export function FindingTrafficPanel({
 
   return (
     <>
-      <Card>
+      <Card className="min-w-0">
         <CardHeader>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle>关联流量 {data ? `(${data.bindings.length})` : ""}</CardTitle>
@@ -111,7 +111,7 @@ export function FindingTrafficPanel({
           </div>
           <CardDescription>按复现顺序组织请求与响应。清理原始流量后，已绑定证据仍然保留。</CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-col gap-3">
+        <CardContent className="flex min-w-0 flex-col gap-3">
           {error ? (
             <Alert variant="destructive">
               <AlertDescription>
@@ -145,12 +145,12 @@ export function FindingTrafficPanel({
                 </div>
                 <Button
                   variant="link"
-                  className="h-auto justify-start p-0 text-left whitespace-normal"
+                  className="h-auto min-w-0 max-w-full justify-start p-0 text-left whitespace-normal"
                   onClick={() => setPreview(b.id)}
                 >
                   <span className="break-all font-mono text-xs">{b.snapshot.url}</span>
                 </Button>
-                {b.note ? <p className="text-sm whitespace-pre-wrap">{b.note}</p> : null}
+                {b.note ? <p className="text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">{b.note}</p> : null}
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-muted-foreground">
                     {new Date(b.snapshot.captured_at * 1000).toLocaleString("zh-CN")}

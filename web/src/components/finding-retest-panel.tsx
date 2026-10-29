@@ -81,9 +81,9 @@ export function FindingRetestPanel({
   const running = items?.find(active);
 
   return (
-    <Card>
+    <Card className="min-w-0">
       <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-3">
-        <div className="flex flex-col gap-1.5">
+        <div className="flex min-w-0 flex-col gap-1.5">
           <CardTitle>漏洞复测</CardTitle>
           <CardDescription>在独立会话中验证当前状态，保留每次复测的结论与证据。</CardDescription>
         </div>
@@ -102,7 +102,7 @@ export function FindingRetestPanel({
           </Button>
         ) : null}
       </CardHeader>
-      <CardContent className="flex flex-col gap-3">
+      <CardContent className="flex min-w-0 flex-col gap-3">
         {error ? (
           <Alert variant="destructive">
             <AlertDescription>

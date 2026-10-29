@@ -31,7 +31,6 @@ import {
   PopoverTitle,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -208,14 +207,14 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
   );
 }
 
-function TaskDetailInner() {
+function TaskDetailInner({ id }: { id: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const id = searchParams.get("id") ?? "";
   const tabParam = searchParams.get("tab");
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  const [loadError, setLoadError] = React.useState("");
   const [tab, setTab] = React.useState(() => taskTabFromParam(tabParam));
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
@@ -263,15 +262,21 @@ function TaskDetailInner() {
     };
   }, [id]);
 
-  const taskLoadInFlight = React.useRef<string | null>(null);
+  const taskLoadInFlight = React.useRef<symbol | null>(null);
   const load = React.useCallback(() => {
-    if (taskLoadInFlight.current === id) return;
-    taskLoadInFlight.current = id;
+    if (!id) {
+      setLoaded(true);
+      return;
+    }
+    if (taskLoadInFlight.current !== null) return;
+    const request = Symbol();
+    taskLoadInFlight.current = request;
     Promise.all([api.task(id), api.stats(id).catch(() => null)])
       .then(([task, s]) => {
-        if (taskLoadInFlight.current !== id) return;
+        if (taskLoadInFlight.current !== request) return;
+        if (task.id !== id) throw new Error("任务响应与当前任务不匹配");
         const base = { ...task };
-        const at = s?.active_task;
+        const at = s?.active_task?.id === id ? s.active_task : undefined;
         if (at) {
           base.in_flight = at.in_flight;
           base.goals_total = at.goals_total;
@@ -281,12 +286,13 @@ function TaskDetailInner() {
         }
         setTask(base);
         setPaused(at?.paused ?? base.paused ?? false);
+        setLoadError("");
       })
-      .catch(() => {
-        // Keep the last rendered task state during a transient poll failure.
+      .catch((error: Error) => {
+        if (taskLoadInFlight.current === request) setLoadError(error.message);
       })
       .finally(() => {
-        if (taskLoadInFlight.current === id) {
+        if (taskLoadInFlight.current === request) {
           taskLoadInFlight.current = null;
           setLoaded(true);
         }
@@ -295,7 +301,10 @@ function TaskDetailInner() {
   React.useEffect(() => {
     load();
     const timer = setInterval(load, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      taskLoadInFlight.current = null;
+      clearInterval(timer);
+    };
   }, [load]);
 
   async function togglePause() {
@@ -324,9 +333,14 @@ function TaskDetailInner() {
   }
 
   if (!task) {
+    let message = "加载中…";
+    if (loaded) message = loadError ? `加载任务失败：${loadError}` : `任务 ${id} 已被删除、归档或不存在`;
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
-        <p className="text-muted-foreground">{loaded ? `任务 ${id} 已被删除、归档或不存在` : "加载中…"}</p>
+      <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+        <p role={loadError ? "alert" : "status"} className="text-muted-foreground [overflow-wrap:anywhere]">
+          {message}
+        </p>
+        {loaded && loadError && <Button variant="outline" onClick={load}>重新加载</Button>}
         {loaded && (
           <Button asChild variant="outline">
             <Link href="/function/tasks">
@@ -371,13 +385,13 @@ function TaskDetailInner() {
   );
 
   return (
-    <Tabs value={tab} onValueChange={changeTab} className="flex flex-1 flex-col gap-0">
+    <Tabs value={tab} onValueChange={changeTab} className="flex min-w-0 flex-1 flex-col gap-0">
       {/* Top fixed area */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
-        <div className="flex items-center gap-2">
-          <SidebarTrigger className="-ml-1" />
-          <Button asChild variant="ghost" size="icon" className="size-7">
-            <Link href="/function/tasks">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <SidebarTrigger className="-ml-1 shrink-0" />
+          <Button asChild variant="ghost" size="icon" className="size-7 shrink-0">
+            <Link href="/function/tasks" aria-label="返回任务列表">
               <ArrowLeftIcon />
             </Link>
           </Button>
@@ -387,38 +401,39 @@ function TaskDetailInner() {
           <code className="hidden rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground sm:inline">
             {task.id}
           </code>
-          <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
-          <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
-          <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
-          {canArchive ? (
-            <AlertDialog>
-              <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>归档任务 #{task.id}？</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    任务图谱、关联记录、独占资产与流量、工作文件和 LLM
-                    历史将压缩到冷存储。归档完成后可在任务列表的“已归档”页还原。
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>取消</AlertDialogCancel>
-                  <AlertDialogAction onClick={() => void archiveTask()}>确认归档</AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex">{archiveTrigger}</span>
-              </TooltipTrigger>
-              <TooltipContent>{archiveDisabledReason}</TooltipContent>
-            </Tooltip>
-          )}
-          <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
-            {controlIcon}
-            {controlLabel}
-          </Button>
+          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+            <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
+            <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
+            {canArchive ? (
+              <AlertDialog>
+                <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>归档任务 #{task.id}？</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      任务图谱、关联记录、独占资产与流量、工作文件和 LLM
+                      历史将压缩到冷存储。归档完成后可在任务列表的“已归档”页还原。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>取消</AlertDialogCancel>
+                    <AlertDialogAction onClick={() => void archiveTask()}>确认归档</AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">{archiveTrigger}</span>
+                </TooltipTrigger>
+                <TooltipContent>{archiveDisabledReason}</TooltipContent>
+              </Tooltip>
+            )}
+            <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
+              {controlIcon}
+              {controlLabel}
+            </Button>
+          </div>
         </div>
         <p className="truncate text-xs text-muted-foreground">{task.goal}</p>
         {/* Tabs */}
@@ -439,7 +454,7 @@ function TaskDetailInner() {
       </header>
 
       {/* Tab content */}
-      <div className="flex-1 p-4 lg:p-6">
+      <div className="min-w-0 flex-1 p-4 lg:p-6">
         <TabsContent value="sessions" className="mt-0">
           <SessionsTab taskId={id} />
         </TabsContent>
@@ -475,11 +490,19 @@ function TaskDetailInner() {
   );
 }
 
+function TaskDetailRoute() {
+  const searchParams = useSearchParams();
+  const id = searchParams.get("id") ?? "";
+  // Query-only navigation reuses this page. A new task must get fresh state for
+  // the header and every tab, including cached sessions and finding links.
+  return <TaskDetailInner key={id} id={id} />;
+}
+
 // useSearchParams must sit under a Suspense boundary for static export.
 export default function TaskDetailPage() {
   return (
     <React.Suspense fallback={null}>
-      <TaskDetailInner />
+      <TaskDetailRoute />
     </React.Suspense>
   );
 }

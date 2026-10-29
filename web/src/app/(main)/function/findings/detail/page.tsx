@@ -18,7 +18,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
@@ -47,17 +46,17 @@ function fmtTime(ts: string) {
 // FieldRow is one label/value line in the right-hand status panel.
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-3 py-2.5">
+    <div className="flex min-w-0 items-start justify-between gap-3 py-2.5">
       <span className="shrink-0 pt-0.5 text-xs text-muted-foreground">{label}</span>
-      <div className="flex min-w-0 flex-col items-end gap-1 text-right text-sm">{children}</div>
+      <div className="flex min-w-0 flex-1 flex-col items-end gap-1 text-right text-sm [overflow-wrap:anywhere]">
+        {children}
+      </div>
     </div>
   );
 }
 
-function FindingDetailInner() {
+function FindingDetailInner({ id, contextTaskId }: { id: string; contextTaskId: string }) {
   const searchParams = useSearchParams();
-  const id = searchParams.get("id") ?? "";
-  const contextTaskId = searchParams.get("context_task") ?? "";
   const fromTaskId = searchParams.get("from_task") ?? contextTaskId;
   const fromTab = searchParams.get("from_tab") === "retests" ? "retests" : "findings";
   const backHref = fromTaskId
@@ -68,20 +67,32 @@ function FindingDetailInner() {
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
+  const loadRequest = React.useRef<symbol | null>(null);
 
   const load = React.useCallback(() => {
     if (!id) {
       setLoaded(true);
       return;
     }
+    const request = Symbol();
+    loadRequest.current = request;
     api
       .getFinding(id, contextTaskId || undefined)
-      .then((f) => setFinding(f))
-      .catch(() => setFinding(null))
-      .finally(() => setLoaded(true));
+      .then((f) => {
+        if (loadRequest.current === request) setFinding(f);
+      })
+      .catch(() => {
+        if (loadRequest.current === request) setFinding(null);
+      })
+      .finally(() => {
+        if (loadRequest.current === request) setLoaded(true);
+      });
   }, [contextTaskId, id]);
   React.useEffect(() => {
     load();
+    return () => {
+      loadRequest.current = null;
+    };
   }, [load]);
 
   const changeSeverity = React.useCallback(
@@ -136,22 +147,25 @@ function FindingDetailInner() {
   const title = finding.name || finding.vulnclass || "未分类";
 
   return (
-    <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
+    <Tabs value={tab} onValueChange={setTab} className="flex w-full min-w-0 flex-1 flex-col gap-0">
       {/* Sticky header */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
-        <div className="flex flex-wrap items-center gap-2">
-          <SidebarTrigger className="-ml-1" />
-          <Button asChild variant="ghost" size="icon" className="size-7">
+        <div className="flex min-w-0 items-start gap-2">
+          <SidebarTrigger className="-ml-1 shrink-0" />
+          <Button asChild variant="ghost" size="icon" className="size-7 shrink-0">
             <Link href={backHref} title={backLabel} aria-label={backLabel}>
               <ArrowLeftIcon />
             </Link>
           </Button>
-          <ShieldAlertIcon className="size-4 text-muted-foreground" />
-          <h1 className="max-w-md truncate text-sm font-semibold" title={title}>
+          <ShieldAlertIcon className="mt-1.5 hidden size-4 shrink-0 text-muted-foreground sm:block" />
+          <h1 className="min-w-0 flex-1 pt-1 text-sm font-semibold [overflow-wrap:anywhere]" title={title}>
             {title}
           </h1>
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">#{finding.id}</code>
-          <Separator orientation="vertical" className="mx-1 h-4" />
+          <code className="mt-1 shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+            #{finding.id}
+          </code>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
           <StatusBadge domain="severity" value={finding.severity} dot />
           <StatusBadge domain="finding" value={finding.status} dot />
           {finding.inherited && finding.source_task_id && (
@@ -165,28 +179,30 @@ function FindingDetailInner() {
       </header>
 
       {/* Tab content */}
-      <div className="flex-1 p-4 lg:p-6">
+      <div className="min-w-0 flex-1 p-3 sm:p-4 lg:p-6">
         {/* 概览：左（摘要 + 证据）/ 右（状态区） */}
-        <TabsContent value="overview" className="mt-0">
-          <div className="grid gap-4 lg:grid-cols-3">
+        <TabsContent value="overview" className="mt-0 min-w-0">
+          <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-3">
             {/* 左栏 */}
-            <div className="flex flex-col gap-4 lg:col-span-2">
-              <Card>
+            <div className="flex min-w-0 flex-col gap-4 lg:col-span-2">
+              <Card className="min-w-0">
                 <CardHeader>
                   <CardTitle className="text-sm">摘要</CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
+                <CardContent className="min-w-0">
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
+                    {finding.summary || "（无摘要）"}
+                  </p>
                 </CardContent>
               </Card>
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
-              <Card>
+              <Card className="min-w-0">
                 <CardHeader>
                   <CardTitle className="text-sm">证据 / PoC</CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="min-w-0">
                   {finding.evidence ? (
-                    <pre className="max-h-[46vh] overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+                    <pre className="max-h-[46dvh] max-w-full overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap [overflow-wrap:anywhere]">
                       {finding.evidence}
                     </pre>
                   ) : (
@@ -202,12 +218,12 @@ function FindingDetailInner() {
                 onChanged={load}
               />
               {/* 证据下方：详细报告(Markdown 渲染) */}
-              <Card>
-                <CardHeader className="flex-row items-center justify-between">
+              <Card className="min-w-0">
+                <CardHeader className="flex flex-row items-center justify-between gap-2">
                   <CardTitle className="text-sm">详细报告</CardTitle>
                   {finding.report && <CopyButton text={finding.report} successMessage="已复制详细报告" />}
                 </CardHeader>
-                <CardContent>
+                <CardContent className="min-w-0">
                   {finding.report_stale ? (
                     <Alert>
                       <AlertDescription>流量证据已变更，详细报告待更新。</AlertDescription>
@@ -223,11 +239,11 @@ function FindingDetailInner() {
             </div>
 
             {/* 右栏：状态区 */}
-            <Card className="h-fit lg:sticky lg:top-24">
+            <Card className="h-fit min-w-0 lg:sticky lg:top-24">
               <CardHeader>
                 <CardTitle className="text-sm">状态</CardTitle>
               </CardHeader>
-              <CardContent className="divide-y">
+              <CardContent className="min-w-0 divide-y">
                 {/* 漏洞 ID */}
                 <FieldRow label="漏洞 ID">
                   <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
@@ -291,11 +307,11 @@ function FindingDetailInner() {
                 {/* 涉及资产 */}
                 <FieldRow label="涉及资产">
                   {finding.assets && finding.assets.length > 0 ? (
-                    <div className="flex flex-wrap justify-end gap-1">
+                    <div className="flex min-w-0 max-w-full flex-wrap justify-end gap-1">
                       {finding.assets.map((a) => (
                         <code
                           key={a.id}
-                          className="max-w-[16rem] truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs"
+                          className="max-w-full rounded bg-muted px-1.5 py-0.5 font-mono text-xs [overflow-wrap:anywhere]"
                           title={`${a.type} · ${a.label}`}
                         >
                           {a.label}
@@ -311,12 +327,14 @@ function FindingDetailInner() {
                 <FieldRow label="所属任务">
                   {finding.task_id ? (
                     <Link
-                      href={`/function/tasks/detail?id=${finding.task_id}`}
-                      className="inline-flex max-w-[16rem] items-center gap-1 text-primary hover:underline"
+                      href={`/function/tasks/detail?id=${encodeURIComponent(finding.task_id)}&tab=findings`}
+                      className="inline-flex min-w-0 max-w-full items-start justify-end gap-1 text-primary hover:underline"
                       title={finding.task_description}
                     >
-                      <span className="truncate">{finding.task_description || `#${finding.task_id}`}</span>
-                      <ArrowUpRightIcon className="size-3 shrink-0" />
+                      <span className="min-w-0 [overflow-wrap:anywhere]">
+                        {finding.task_description || `#${finding.task_id}`}
+                      </span>
+                      <ArrowUpRightIcon className="mt-1 size-3 shrink-0" />
                     </Link>
                   ) : (
                     <span className="text-muted-foreground">—（任务已删除）</span>
@@ -333,7 +351,7 @@ function FindingDetailInner() {
         </TabsContent>
 
         {/* 链路图：从任务初始节点回溯到本漏洞节点的攻击链路 */}
-        <TabsContent value="lineage" className="mt-0">
+        <TabsContent value="lineage" className="mt-0 min-w-0">
           <FindingLineageView findingId={finding.id} />
         </TabsContent>
       </div>
@@ -341,11 +359,18 @@ function FindingDetailInner() {
   );
 }
 
+function FindingDetailRoute() {
+  const searchParams = useSearchParams();
+  const id = searchParams.get("id") ?? "";
+  const contextTaskId = searchParams.get("context_task") ?? "";
+  return <FindingDetailInner key={`${id}:${contextTaskId}`} id={id} contextTaskId={contextTaskId} />;
+}
+
 // useSearchParams must sit under a Suspense boundary for static export.
 export default function FindingDetailPage() {
   return (
     <React.Suspense fallback={null}>
-      <FindingDetailInner />
+      <FindingDetailRoute />
     </React.Suspense>
   );
 }

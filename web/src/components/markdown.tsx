@@ -23,7 +23,7 @@ const components: Components = {
     <blockquote className="my-1 border-l-2 border-border pl-2.5 text-muted-foreground" {...p} />
   ),
   pre: ({ node, ...p }) => (
-    <pre className="my-1.5 overflow-auto rounded-md bg-muted/70 p-2.5 text-xs leading-relaxed" {...p} />
+    <pre className="my-1.5 min-w-0 max-w-full overflow-auto rounded-md bg-muted/70 p-2.5 text-xs leading-relaxed" {...p} />
   ),
   code: ({ node, className, children, ...rest }) => {
     const block = /language-/.test(className || "");
@@ -38,7 +38,7 @@ const components: Components = {
     );
   },
   table: ({ node, ...p }) => (
-    <div className="my-1.5 overflow-x-auto">
+    <div className="my-1.5 min-w-0 max-w-full overflow-x-auto">
       <table className="w-full border-collapse text-xs" {...p} />
     </div>
   ),
@@ -50,7 +50,7 @@ const components: Components = {
 
 export function Markdown({ text }: { text: string }) {
   return (
-    <div className="min-w-0 space-y-1.5 text-sm [&>*:first-child]:mt-0">
+    <div className="min-w-0 max-w-full space-y-1.5 text-sm [overflow-wrap:anywhere] [&>*:first-child]:mt-0 [&_img]:h-auto [&_img]:max-w-full">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </ReactMarkdown>
