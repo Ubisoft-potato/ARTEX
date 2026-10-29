@@ -55,8 +55,8 @@ func TestCoverageCategoryApplicability(t *testing.T) {
 	if coverageCategoryApplies(health, "ssrf") {
 		t.Fatal("static GET endpoint without URL params should not be applicable to SSRF")
 	}
-	if coverageCategoryApplies(health, "authz") {
-		t.Fatal("static GET endpoint without input should not be applicable to authz")
+	if !coverageCategoryApplies(health, "authz") {
+		t.Fatal("all endpoints retain authz candidates")
 	}
 	if coverageCategoryApplies(health, "xss") {
 		t.Fatal("static GET endpoint without input should not be applicable to XSS")
@@ -69,8 +69,8 @@ func TestCoverageCategoryApplicability(t *testing.T) {
 		if coverageEndpointHasInput(ep) {
 			t.Fatalf("%s without params must not count as input", method)
 		}
-		if coverageCategoryApplies(ep, "authz") {
-			t.Fatalf("%s without params must not be applicable to authz", method)
+		if !coverageCategoryApplies(ep, "authz") {
+			t.Fatalf("%s endpoint must retain authz candidate", method)
 		}
 	}
 
@@ -88,69 +88,11 @@ func TestCoverageCategoryApplicability(t *testing.T) {
 }
 
 func TestCoverageIntentState(t *testing.T) {
-	tests := []struct {
-		name         string
-		state        string
-		hasEvidence  bool
-		observed     bool
-		finding      bool
-		wantState    string
-		wantPositive bool
-	}{
-		{name: "open is in flight", state: "open", wantState: coverageStateInFlight},
-		{name: "running is in flight", state: "running", wantState: coverageStateInFlight},
-		{name: "observed fact covers", state: "done", hasEvidence: true, observed: true, wantState: coverageStateCovered},
-		{name: "finding covers positively", state: "done", hasEvidence: true, finding: true, wantState: coverageStateCovered, wantPositive: true},
-		{name: "inferred fact is inconclusive", state: "done", hasEvidence: true, wantState: coverageStateInconclusive},
-		{name: "done without evidence is inconclusive", state: "done", wantState: coverageStateInconclusive},
-		{name: "exhausted is debt", state: "exhausted", wantState: coverageStateDebt},
-		{name: "blocked is debt", state: "blocked", wantState: coverageStateDebt},
-		{name: "deleted is excluded", state: "deleted", wantState: ""},
-		{name: "stopped is excluded", state: "stopped", wantState: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			state, _, positive := coverageIntentState(tt.state, tt.hasEvidence, tt.observed, tt.finding)
-			if state != tt.wantState || positive != tt.wantPositive {
-				t.Fatalf("state=%q positive=%v, want state=%q positive=%v", state, positive, tt.wantState, tt.wantPositive)
-			}
-		})
-	}
-}
-
-func TestCoverageIntentEvidenceRequiresConfirmedNodes(t *testing.T) {
-	payload := func(confidence, evidence string) json.RawMessage {
-		raw, err := json.Marshal(map[string]any{"confidence": confidence, "evidence": evidence})
-		if err != nil {
-			t.Fatal(err)
+	for state, want := range map[string]string{"open": coverageStateInFlight, "running": coverageStateInFlight, "paused": coverageStateInFlight, "done": coverageStateInconclusive, "exhausted": coverageStateDebt, "blocked": coverageStateDebt, "deleted": "", "stopped": ""} {
+		got, _ := coverageIntentState(state)
+		if got != want {
+			t.Fatalf("%s: got %s want %s", state, got, want)
 		}
-		return raw
-	}
-	facts := map[int64]*db.Node{
-		1: {ID: 1, Kind: db.KindFact, State: "confirmed", Payload: payload("observed", "saw it")},
-		2: {ID: 2, Kind: db.KindFact, State: "dismissed", Payload: payload("observed", "saw it")},
-		3: {ID: 3, Kind: db.KindFact, State: "confirmed", Payload: payload("inferred", "looks like it")},
-	}
-	findings := map[int64]*db.Node{
-		4: {ID: 4, Kind: db.KindFinding, State: "confirmed"},
-		5: {ID: 5, Kind: db.KindFinding, State: "dismissed"},
-	}
-	yields := map[int64][]int64{10: {1, 2, 3, 4, 5}}
-
-	has, observed, finding := coverageIntentEvidence(10, yields, facts, findings)
-	if !has || !observed || !finding {
-		t.Fatalf("confirmed evidence: has=%v observed=%v finding=%v, want true/true/true", has, observed, finding)
-	}
-
-	// Dismissed children are not evidence at all.
-	has, observed, finding = coverageIntentEvidence(10, map[int64][]int64{10: {2, 5}}, facts, findings)
-	if has || observed || finding {
-		t.Fatalf("dismissed evidence: has=%v observed=%v finding=%v, want all false", has, observed, finding)
-	}
-	// An inferred fact is evidence for "tried", but not observed coverage.
-	has, observed, finding = coverageIntentEvidence(10, map[int64][]int64{10: {3}}, facts, findings)
-	if !has || observed || finding {
-		t.Fatalf("inferred evidence: has=%v observed=%v finding=%v, want true/false/false", has, observed, finding)
 	}
 }
 
@@ -175,22 +117,6 @@ func TestCoverageIntentCategoriesUsesStructuredField(t *testing.T) {
 	}
 	if _, err := normalizeCoverageCategories([]string{"authz", "typo"}); err == nil {
 		t.Fatal("unknown category must be rejected on write")
-	}
-}
-
-func TestCoverageMatrixForTopNSlicesWithoutMutatingBase(t *testing.T) {
-	base := map[string]any{
-		"top_gaps": []coverageGap{{AssetID: 1}, {AssetID: 2}, {AssetID: 3}},
-		"summary":  "x",
-	}
-	out := coverageMatrixForTopN(base, 2)
-	gaps, _ := out["top_gaps"].([]coverageGap)
-	if len(gaps) != 2 || gaps[1].AssetID != 2 {
-		t.Fatalf("top_n slice = %+v, want first two gaps", gaps)
-	}
-	baseGaps, _ := base["top_gaps"].([]coverageGap)
-	if len(baseGaps) != 3 {
-		t.Fatalf("base cache mutated: %+v", baseGaps)
 	}
 }
 
@@ -273,11 +199,12 @@ func TestCoverageMatrixCountsUntestedAndExcludesExhausted(t *testing.T) {
 	rawSSH, _ := json.Marshal(sshID)
 	rawSSHIntent, _ := json.Marshal(sshIntent)
 	if _, err := tools.recordOneFact(factItem{
-		Summary:    "SSH 默认口令不存在",
-		Evidence:   "ssh login with root/root failed",
-		Confidence: "observed",
-		IntentID:   rawSSHIntent,
-		AssetIDs:   []json.RawMessage{rawSSH},
+		Summary:        "SSH 默认口令不存在",
+		Evidence:       "ssh login with root/root failed",
+		Confidence:     "observed",
+		IntentID:       rawSSHIntent,
+		AssetIDs:       []json.RawMessage{rawSSH},
+		CoverageChecks: []db.CoverageCheck{{AssetID: sshID, Category: "auth", Evidence: "login rejected"}},
 	}, sshIntent); err != nil {
 		t.Fatal(err)
 	}

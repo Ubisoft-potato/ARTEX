@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -95,12 +94,6 @@ type ToolSet struct {
 	// overviewBudget bounds graph_overview output in bytes. The planner and worker
 	// set it from their actual model window; zero keeps the default tool budget.
 	overviewBudget int
-	// coverageCache is a per-ToolSet (i.e. one planner round) memo of the matrix.
-	// Planner can call coverage_matrix more than once (often with different
-	// top_n); one full snapshot is computed and top_gaps is sliced per call. It is
-	// deliberately not shared across rounds, where worker writes must be visible.
-	coverageMu    sync.Mutex
-	coverageCache map[int]map[string]any
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
@@ -1496,20 +1489,22 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。实际验证的资产与类别用 coverage_checks 逐项登记，不扩散到整个意图。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本"),
+		"coverage_checks":  coverageChecksSchema(),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
-			IntentID                                     json.RawMessage   `json:"intent_id"`
-			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
-			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
-			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
+			IntentID                                     json.RawMessage    `json:"intent_id"`
+			AssetIDs                                     []json.RawMessage  `json:"asset_ids"`
+			TrafficRefs                                  []db.TrafficRef    `json:"traffic_refs"`
+			CoverageChecks                               []db.CoverageCheck `json:"coverage_checks"`
+			EvidenceHintID                               json.RawMessage    `json:"evidence_hint_id"`
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
@@ -1532,7 +1527,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CoverageChecks: a.CoverageChecks}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1583,12 +1578,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary    string            `json:"summary"`
-	Detail     string            `json:"detail"`
-	Evidence   string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID   json.RawMessage   `json:"intent_id"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	CoverageChecks []db.CoverageCheck `json:"coverage_checks"`
+	Summary        string             `json:"summary"`
+	Detail         string             `json:"detail"`
+	Evidence       string             `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence     string             `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
+	IntentID       json.RawMessage    `json:"intent_id"`
+	AssetIDs       []json.RawMessage  `json:"asset_ids"`
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1597,7 +1593,21 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
+	it.Confidence = strings.ToLower(strings.TrimSpace(it.Confidence))
+	if it.Confidence == "observed" && strings.TrimSpace(it.Evidence) == "" {
+		return 0, fmt.Errorf("observed 事实必须提供非空 evidence")
+	}
+	if it.Confidence != "" && it.Confidence != "observed" && it.Confidence != "inferred" {
+		return 0, fmt.Errorf("confidence 必须为 observed 或 inferred")
+	}
+	checks, err := db.NormalizeCoverageChecks(it.CoverageChecks, pidList(it.AssetIDs))
+	if err != nil {
+		return 0, err
+	}
 	payload := map[string]any{"summary": it.Summary}
+	if len(checks) > 0 {
+		payload["coverage_checks"] = checks
+	}
 	if it.Detail != "" {
 		payload["detail"] = it.Detail
 	}
@@ -1635,23 +1645,26 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
-		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
+		"  · confidence=observed（输出里直接看到，必须有非空 evidence）| inferred（据现象推断）。coverage_checks 逐项提供 asset_id/category/evidence，不用意图完成状态替代证据。\n"+
 		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
 		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"coverage_checks": coverageChecksSchema(),
+			"facts":           map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids/coverage_checks）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":         str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+			"intent_id":       idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+			"detail":          str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+			"evidence":        str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+			"confidence":      str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+			"asset_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
 			}
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			batch := len(a.Facts) > 0
 			items := a.Facts
 			if !batch {
@@ -2425,10 +2438,10 @@ func classifyCategories(summary string) []string {
 // and the denominator is every in-scope asset, not just assets with an intent.
 func (t *ToolSet) coverageMatrix() actool.CoreTool {
 	return readTool("coverage_matrix",
-		"生成本任务的攻击面覆盖矩阵：按“范围内资产 × 适用攻击类别”统计。只有 observed 事实或 finding 算已验证覆盖；open/running 是在途，exhausted/blocked 是债务，都不能算已覆盖。\n"+
+		"生成本任务的攻击面覆盖矩阵：按“范围内资产 × 适用攻击类别”统计。只有 done 意图下 confirmed 结果的明确 coverage_checks 能关闭对应格子，事实还须 observed 且 evidence 非空；open/running 是在途，exhausted/blocked 是债务，都不能算已覆盖。\n"+
 			"类别会按资产类型/服务过滤（例如 SSH 不会缺 XSS/SSRF/业务逻辑），避免不适用类别占据 top_gaps。\n"+
-			"返回：coverage_pct（已验证格子占比）、category_coverage（各类别适用/已覆盖/在途/债务/未测资产数）、top_gaps（缺失最多且风险较高的资产+缺失类别）、zero_targeted_count/assets（范围内完全没有意图关联的资产）。\n"+
-			"建议每轮规划前调一次，识别系统性空白；深度信号仍优先于铺面。",
+			"返回：coverage_pct（已验证格子占比）、category_coverage（各类别适用/已覆盖/在途/债务/未测资产数）、top_gaps（可补派的资产+缺失类别，不含在途和待核实格）、pending_review（历史待核实）、in_flight（在途）、zero_targeted_count/assets（范围内完全没有意图关联的资产）。\n"+
+			"历史待核实项先复核，不能因覆盖率下降批量重新探索；truncated=true 时未读取项保持未知，不能据此批量派工。深度信号仍优先于铺面。",
 		obj(map[string]any{
 			"top_n": intp("返回 top_gaps 的资产数（默认 8，最多 50）"),
 		}),

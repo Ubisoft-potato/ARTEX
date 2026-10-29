@@ -413,7 +413,7 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 func (t *ToolSet) listUntestedAssets() actool.CoreTool {
 	return readTool(
 		"list_untested_assets",
-		"查询【本任务及直接关联任务】范围内、还没被事实锚点覆盖的资产（关联范围只读，供你自己判断要不要补测，不代替你决策）。\n"+
+		"查询【本任务及直接关联任务】范围内、还没有验证记录的资产（有非空证据的 confirmed observed 事实或 confirmed 漏洞记录才算验证记录；该资产指标不代表全部攻击类别完成）（关联范围只读，供你自己判断要不要补测，不代替你决策）。\n"+
 			"可选按资产类型过滤：root_domain/subdomain/service/app/endpoint/ip。\n"+
 			"分页：page 从 1 起、page_size 默认 10。返回 {assets:[{id,type,label}], total, page, page_size}。仅任务上下文可用。",
 		obj(map[string]any{

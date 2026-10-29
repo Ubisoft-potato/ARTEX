@@ -772,7 +772,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <TargetIcon className="size-4 text-emerald-500" /> 资产测试覆盖度
+              <TargetIcon className="size-4 text-emerald-500" /> 已有验证记录的资产占比
               <span className="text-muted-foreground text-xs font-normal">（粗估，仅供参考）</span>
             </CardTitle>
           </CardHeader>
@@ -782,9 +782,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
               </span>
               <span className="text-muted-foreground text-sm">
-                已测 {coverage.tested} / 范围内 {coverage.denominator}
+                有验证记录 {coverage.tested} / 范围内 {coverage.denominator}
               </span>
             </div>
+            <p className="text-xs text-muted-foreground">
+              认可有非空证据的已确认直接观察或漏洞记录（含直接关联任务），不代表全部攻击类别完成。
+            </p>
             {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}
             {coverage.by_type.length > 0 && (
               <div className="flex flex-wrap gap-1.5 text-xs">

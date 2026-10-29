@@ -327,6 +327,7 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	CoverageChecks                                       []CoverageCheck
 }
 
 type RecordedFinding struct {
@@ -357,7 +358,11 @@ func RecordFindingTx(tx *sql.Tx, in RecordFindingInput, prepared []PreparedTraff
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	checks, err := NormalizeCoverageChecks(in.CoverageChecks, in.AssetIDs)
+	if err != nil {
+		return nil, err
+	}
+	payload, _ := json.Marshal(map[string]any{"coverage_checks": checks, "vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
@@ -385,7 +390,6 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
-	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
 }

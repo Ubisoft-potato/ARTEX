@@ -37,19 +37,25 @@ const taskScopeMatch = `(
        ))
 )`
 
-// observedFactPredicate matches coverageFactObserved in the agent package:
-// dismissed facts never count, inferred facts never count, and an otherwise
-// unlabelled fact needs non-empty evidence. Shared by TaskCoverageWithSources
-// and ListUntestedAssetsWithSources so their backlog agrees with coverage_matrix.
+// Match Go strings.TrimSpace, including Unicode whitespace, regardless of the
+// database locale. PostgreSQL E strings decode these escapes before btrim runs.
+const coverageWhitespaceSQL = `E' \t\n\x0b\f\r\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'`
+
+// Asset verification requires a confirmed finding or a confirmed observed fact
+// with non-whitespace evidence. This metric does not imply category completion.
 const observedFactPredicate = `en.kind='fact'
-   AND en.state='confirmed'
-   AND (
-        lower(btrim(COALESCE(en.payload->>'confidence','')))='observed'
-     OR (
-        lower(btrim(COALESCE(en.payload->>'confidence','')))<>'inferred'
-        AND btrim(COALESCE(en.payload->>'evidence',''))<>''
-     )
-   )`
+ AND en.state='confirmed'
+ AND lower(btrim(COALESCE(en.payload->>'confidence',''), ` + coverageWhitespaceSQL + `))='observed'
+ AND jsonb_typeof(en.payload->'evidence')='string'
+ AND btrim(COALESCE(en.payload->>'evidence',''), ` + coverageWhitespaceSQL + `)<>''`
+
+const verifiedResultPredicate = `((` + observedFactPredicate + `) OR (
+ en.kind='finding' AND en.state='confirmed' AND (
+  (jsonb_typeof(en.payload->'evidence')='string' AND btrim(COALESCE(en.payload->>'evidence',''), ` + coverageWhitespaceSQL + `)<>'')
+  OR (jsonb_typeof(en.payload->'evidence')='object' AND jsonb_typeof(en.payload->'evidence'->'poc')='string'
+      AND btrim(COALESCE(en.payload->'evidence'->>'poc',''), ` + coverageWhitespaceSQL + `)<>'')
+ )
+))`
 
 const contextCoverageCTE = directTaskContextCTE + `,
 target AS (
@@ -71,7 +77,7 @@ tested AS (
   FROM exploration_anchors ea
   JOIN exploration_nodes en ON en.id=ea.node_id
   JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
-  WHERE ` + observedFactPredicate + `
+  WHERE ` + verifiedResultPredicate + `
 )`
 
 // scopeTargetCTE selects every asset that BELONGS to the current task's (and its
@@ -132,8 +138,8 @@ ORDER BY CASE WHEN ts.task_id=$1 THEN 0 ELSE 1 END, ts.id`, taskID)
 
 // TaskCoverageWithSources computes one coverage view over the union of the
 // current task and its direct sources: source scopes and anchored assets extend
-// the denominator, while confirmed observed fact anchors count as tested
-// (dismissed and inferred facts do not). No row is copied.
+// the denominator, while verified result anchors count as tested
+// (confirmed findings or confirmed observed facts, with non-empty evidence). No row is copied.
 func (s *AssetStore) TaskCoverageWithSources(taskID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`WITH `+directTaskContextCTE+`
@@ -186,7 +192,7 @@ ORDER BY last_seen DESC, id DESC`, taskID)
 
 // ListUntestedAssetsWithSources is the direct-source-aware backlog query used
 // by inherited tasks. Confirmed observed fact anchors remove assets from the
-// backlog; dismissed/inferred facts do not.
+// backlog; dismissed/inferred facts and empty evidence do not.
 func (s *AssetStore) ListUntestedAssetsWithSources(taskID int64, typ string, limit, offset int) ([]CoverageAsset, int, error) {
 	if limit <= 0 {
 		limit = 10

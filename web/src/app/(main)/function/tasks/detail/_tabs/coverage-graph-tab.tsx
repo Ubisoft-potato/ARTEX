@@ -240,7 +240,7 @@ function toG6Nodes(renderNodes: RenderNode[]): G6NodeDatum[] {
 // 回调形参用 unknown 满足 G6 签名，内部用 nd() 强转回我们的顶层结构。
 const nd = (d: unknown) => d as G6NodeDatum;
 
-// 已测=实色高亮；范围内未测=灰；范围外/折叠=更淡的灰 + 虚线描边。
+// 有验证记录=实色高亮；范围内无验证记录=灰；范围外/折叠=更淡的灰 + 虚线描边。
 function nodeFill(d: G6NodeDatum): string {
   if (d.fold) return "#f1f5f9";
   if (!d.inScope) return "#e2e8f0";
@@ -347,12 +347,12 @@ function AssetSheet({
                 <section>
                   <h4 className="text-muted-foreground mb-1 text-xs font-medium">属性</h4>
                   <DetailRow label="类型">{meta.label}</DetailRow>
-                  <DetailRow label="测试状态">
+                  <DetailRow label="验证记录">
                     {node.in_scope ? (
                       node.tested ? (
-                        <span className="text-emerald-600 dark:text-emerald-400">已测试</span>
+                        <span className="text-emerald-600 dark:text-emerald-400">有验证记录</span>
                       ) : (
-                        <span className="text-neutral-500">未测试</span>
+                        <span className="text-neutral-500">无验证记录</span>
                       )
                     ) : (
                       <span className="text-neutral-400">范围外（连接节点）</span>
@@ -416,7 +416,7 @@ function FoldSheet({
               <SheetTitle className="text-base">
                 未展示的{meta.label}（{fold.hidden.length}）
               </SheetTitle>
-              <p className="text-muted-foreground text-xs">已测优先展示。点「展示更多」把下一批拉进图里。</p>
+              <p className="text-muted-foreground text-xs">有验证记录优先展示。点「展示更多」把下一批拉进图里。</p>
             </SheetHeader>
             <ScrollArea className="min-h-0 flex-1">
               <div className="flex flex-col gap-1 p-3">
@@ -481,7 +481,7 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
       .taskCoverageGraph(taskId)
       .then((g) => {
         // 资产覆盖度功能关闭(B1)：仍出图(范围内资产/company 关联依旧可见)，但抹平
-        // tested 状态——不显示测试进度、不做已测高亮。
+        // tested 状态——不显示测试进度、不做有验证记录高亮。
         const nodes = coverageEnabled ? (g.nodes ?? []) : (g.nodes ?? []).map((n) => ({ ...n, tested: false }));
         setData({ nodes, edges: g.edges ?? [] });
       })
@@ -648,7 +648,7 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
               {coverageEnabled && (
                 <>
                   {" "}
-                  · 已测{" "}
+                  · 有验证记录{" "}
                   <span className="font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">{tested}</span>
                 </>
               )}
@@ -678,10 +678,10 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
           {coverageEnabled && (
             <>
               <span className="inline-flex items-center gap-1.5">
-                <span className="size-3 rounded-full bg-emerald-500" /> 已测（高亮）
+                <span className="size-3 rounded-full bg-emerald-500" /> 有验证记录（高亮，不代表全部类别完成）
               </span>
               <span className="inline-flex items-center gap-1.5">
-                <span className="size-3 rounded-full bg-neutral-400" /> 未测
+                <span className="size-3 rounded-full bg-neutral-400" /> 无验证记录
               </span>
             </>
           )}

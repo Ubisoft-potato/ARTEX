@@ -280,7 +280,7 @@ type Coverage struct {
 	Enabled     bool             `json:"enabled"`     // 资产覆盖度功能是否开启；false 时其余字段为零值
 	ScopeRows   int              `json:"scope_rows"`  // 0 → 范围未锚定
 	Denominator int              `json:"denominator"` // 范围内资产数
-	Tested      int              `json:"tested"`      // 已测(约)
+	Tested      int              `json:"tested"`      // 有验证记录（不代表全部类别完成）
 	Pct         *float64         `json:"pct"`         // 覆盖度；分母 0 时 null
 	ByType      []CoverageByType `json:"by_type"`     // 按资产类型的 总数/已测
 }
@@ -311,7 +311,7 @@ tested AS (
   SELECT DISTINCT ea.asset_id
   FROM exploration_anchors ea
   JOIN exploration_nodes en ON en.id = ea.node_id
-  WHERE en.exploration_id = $2 AND ` + observedFactPredicate + `
+  WHERE en.exploration_id = $2 AND ` + verifiedResultPredicate + `
 )`
 
 // TaskCoverage computes rough per-type coverage for a task. taskID indexes
