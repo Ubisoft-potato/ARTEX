@@ -1333,3 +1333,13 @@ CREATE INDEX IF NOT EXISTS idx_side_requests_history ON side_question_requests(s
 -- Additive v3 archive fields; old archives restore these as empty objects.
 ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS memory JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS context_info JSONB NOT NULL DEFAULT '{}';
+
+-- One-shot task controls. All instants inside payload are RFC3339 UTC.
+CREATE TABLE IF NOT EXISTS task_schedules (
+    task_id BIGINT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL,
+    start_at TIMESTAMPTZ,
+    stop_at TIMESTAMPTZ
+);
+ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS start_at TIMESTAMPTZ;
+ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS stop_at TIMESTAMPTZ;

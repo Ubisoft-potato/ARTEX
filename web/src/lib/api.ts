@@ -1,3 +1,4 @@
+import type { TaskSchedule } from "@/components/task-schedule";
 // Real backend client. /api/* is proxied to the Go backend (next.config rewrites).
 // Returns the domain types in lib/types.ts. Shapes match the backend handlers;
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
@@ -242,8 +243,10 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    schedule?: TaskSchedule;
   }) =>
     post<Task>("/tasks", {
+      schedule: input.schedule,
       name: input.name ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
@@ -290,6 +293,9 @@ export const api = {
       active_llm_profile_id: activeLLMProfileId ?? null,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
+  taskSchedule: (id: string) => get<TaskSchedule>(`/tasks/${id}/schedule`),
+  saveTaskSchedule: (id: string, schedule: TaskSchedule) => put<TaskSchedule>(`/tasks/${id}/schedule`, schedule),
+  cancelTaskSchedule: (id: string, revision: number) => del<TaskSchedule>(`/tasks/${id}/schedule`, { revision }),
   controlTask: (id: string, action: "pause" | "resume") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>

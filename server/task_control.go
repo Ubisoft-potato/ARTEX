@@ -90,7 +90,29 @@ func (s *Server) resumeAdmissionMode(t *Task) string {
 // deliberately limited to paused tasks; reruns and finding follow-ups use
 // admitTask directly when they need to revive a terminal task.
 func (s *Server) applyTaskControl(t *Task, action string) (taskControlResult, error) {
-	return s.applyTaskControlWithCause(t, action, agent.AbortPausedByUser)
+	s.scheduleMu.Lock()
+	defer s.scheduleMu.Unlock()
+	// Read before control so storage errors do not silently leave a live timer.
+	var schedule *db.TaskSchedule
+	if s.m.pg != nil && t != nil {
+		release, lockErr := s.m.pg.LockTaskSchedules(context.Background())
+		if lockErr != nil {
+			return taskControlResult{}, lockErr
+		}
+		defer release()
+		all, err := s.m.pg.TaskSchedules()
+		if err != nil {
+			return taskControlResult{}, err
+		}
+		schedule = all[t.ID]
+	}
+	result, err := s.applyTaskControlWithCause(t, action, agent.AbortPausedByUser)
+	if err == nil && schedule != nil {
+		cancelSchedule(schedule)
+		schedule.Revision++
+		err = s.m.pg.SaveTaskSchedule(t.ID, schedule)
+	}
+	return result, err
 }
 
 func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause error) (taskControlResult, error) {

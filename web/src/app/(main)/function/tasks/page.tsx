@@ -47,6 +47,7 @@ import { toast } from "sonner";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
+import { emptyScheduleDraft, encodeSchedule, ScheduleFields } from "@/components/task-schedule";
 import { TaskTemplateControls } from "@/components/task-template-controls";
 import {
   AlertDialog,
@@ -1345,6 +1346,18 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
       >
         {task.name?.trim() ? task.name : <span className="text-muted-foreground">未命名</span>}
       </Link>
+      {task.schedule && [task.schedule.start, task.schedule.stop].some((e) => e?.state === "pending") && (
+        <span className="text-xs text-muted-foreground" title={task.schedule.timezone}>
+          {[task.schedule.start, task.schedule.stop]
+            .filter((e) => e?.state === "pending")
+            .sort((a, b) => Date.parse(a!.at) - Date.parse(b!.at))
+            .slice(0, 1)
+            .map(
+              (e) =>
+                `${e === task.schedule?.start ? "启动" : "停止"} ${new Intl.DateTimeFormat("zh-CN", { timeZone: task.schedule!.timezone, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZoneName: "short" }).format(new Date(e!.at))}`,
+            )}
+        </span>
+      )}
       <Button
         type="button"
         variant="ghost"
@@ -3055,6 +3068,7 @@ function CreateTaskSheet({
   const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
   const [creating, setCreating] = React.useState(false);
+  const [scheduleDraft, setScheduleDraft] = React.useState(emptyScheduleDraft);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
@@ -3121,6 +3135,7 @@ function CreateTaskSheet({
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
+        schedule: scheduleDraft.start || scheduleDraft.stop ? encodeSchedule(scheduleDraft) : undefined,
         timeoutSeconds: timeoutSec,
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
@@ -3135,6 +3150,7 @@ function CreateTaskSheet({
       setSourceTaskIDs([]);
       setCompanyIDs([]);
       setLLMProfileIDs([]);
+      setScheduleDraft(emptyScheduleDraft());
       setTimeoutMin("");
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
@@ -3295,6 +3311,7 @@ function CreateTaskSheet({
               </CollapsibleTrigger>
               <CollapsibleContent className="grid gap-5 pt-5">
                 <div className="grid gap-2">
+                  <ScheduleFields value={scheduleDraft} onChange={setScheduleDraft} />
                   <Label htmlFor="timeout-min">任务超时（分钟，可选）</Label>
                   <Input
                     id="timeout-min"

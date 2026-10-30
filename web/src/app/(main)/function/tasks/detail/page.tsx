@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
+import { TaskScheduleControl } from "@/components/task-schedule";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -337,7 +338,11 @@ function TaskDetailInner({ id }: { id: string }) {
         <p role={loadError ? "alert" : "status"} className="text-muted-foreground [overflow-wrap:anywhere]">
           {message}
         </p>
-        {loaded && loadError && <Button variant="outline" onClick={load}>重新加载</Button>}
+        {loaded && loadError && (
+          <Button variant="outline" onClick={load}>
+            重新加载
+          </Button>
+        )}
         {loaded && (
           <Button asChild variant="outline">
             <Link href="/function/tasks">
@@ -399,6 +404,7 @@ function TaskDetailInner({ id }: { id: string }) {
             {task.id}
           </code>
           <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+            <TaskScheduleControl id={task.id} onUpdated={load} />
             <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
             <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
             {canArchive ? (
