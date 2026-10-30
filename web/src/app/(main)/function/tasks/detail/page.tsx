@@ -210,12 +210,11 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
 function TaskDetailInner({ id }: { id: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const tabParam = searchParams.get("tab");
+  const tab = taskTabFromParam(searchParams.get("tab"));
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
   const [loadError, setLoadError] = React.useState("");
-  const [tab, setTab] = React.useState(() => taskTabFromParam(tabParam));
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -227,20 +226,18 @@ function TaskDetailInner({ id }: { id: string }) {
       .catch(() => setProfiles([]));
   }, []);
 
-  // Keep the tab in the URL so browser back / a detail-page back link can return
-  // to the same task tab (e.g. ?tab=findings) instead of defaulting to sessions.
-  React.useEffect(() => {
-    setTab(taskTabFromParam(tabParam));
-  }, [tabParam]);
-
   const changeTab = React.useCallback(
     (next: string) => {
-      setTab(next);
-      const params = new URLSearchParams(searchParams.toString());
-      params.set("tab", next);
-      router.replace(`/function/tasks/detail?${params.toString()}`, { scroll: false });
+      // Tabs are local UI state. A router navigation can finish after another
+      // task has opened and restore its old query string. Next's history API
+      // integration updates useSearchParams without an asynchronous navigation.
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("id") !== id) return;
+      url.searchParams.set("id", id);
+      url.searchParams.set("tab", taskTabFromParam(next));
+      window.history.replaceState(null, "", url);
     },
-    [router, searchParams],
+    [id],
   );
 
   React.useEffect(() => {

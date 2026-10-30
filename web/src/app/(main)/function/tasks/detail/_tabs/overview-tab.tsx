@@ -358,8 +358,8 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           api.intents(taskId),
           api.findings(taskId),
         ]);
-        if (cancelled) return;
-        const activeTask = statsResp.active_task;
+        if (cancelled || taskResp.id !== taskId) return;
+        const activeTask = statsResp.active_task?.id === taskId ? statsResp.active_task : undefined;
         setTask(
           activeTask
             ? {
@@ -372,7 +372,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               }
             : taskResp,
         );
-        setStats(statsResp);
+        setStats(activeTask ? statsResp : null);
         setIntents(intentsResp);
         setFindings(findingsResp);
         // coverage is independent + may 503 when no asset store — fetch separately so
