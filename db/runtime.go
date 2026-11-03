@@ -23,7 +23,9 @@ func openPostgres(dsn string) (*sql.DB, error) {
 		return nil, err
 	}
 	if cfg.ConnectTimeout == 0 {
-		cfg.ConnectTimeout = 5 * time.Second
+		// 本机建连包含 fork + SCRAM 认证，慢盘/高负载时可能接近秒级。
+		// 5s 太紧会把短暂的调度抖动放大成连接超时，留出重试余量。
+		cfg.ConnectTimeout = 15 * time.Second
 	}
 	for key, value := range map[string]string{"statement_timeout": "30000", "lock_timeout": "5000", "idle_in_transaction_session_timeout": "120000"} {
 		if cfg.RuntimeParams[key] == "" {
@@ -37,8 +39,10 @@ func openPostgres(dsn string) (*sql.DB, error) {
 	}
 	d.SetMaxOpenConns(maxOpen)
 	d.SetMaxIdleConns(min(8, maxOpen))
-	d.SetConnMaxIdleTime(5 * time.Minute)
-	d.SetConnMaxLifetime(30 * time.Minute)
+	// 连接池没有最小连接数，空闲/到期回收后的首次请求需要重新建连。
+	// 拉长空闲存活与回收周期，避免低峰后再来一波任务时频繁冷启动。
+	d.SetConnMaxIdleTime(30 * time.Minute)
+	d.SetConnMaxLifetime(2 * time.Hour)
 	return d, nil
 }
 
